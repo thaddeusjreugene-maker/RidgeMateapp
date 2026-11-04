@@ -41,6 +41,10 @@ create table if not exists public.invites (
   uses         int not null default 0,
   created_at   timestamptz not null default now()
 );
+-- Personal invites (from an imported roster) carry the person's details
+alter table public.invites add column if not exists name  text not null default '';
+alter table public.invites add column if not exists phone text not null default '';
+alter table public.invites add column if not exists email text not null default '';
 
 -- ---------------------------------------------------------------------
 -- Leads (a pinned door, a call-in lead, a customer). Everything a lead
@@ -405,6 +409,27 @@ begin
   return c;
 end $$;
 
+-- Personal invite for one person from a roster: single use, good for 30 days
+create or replace function public.create_invite_for(ws uuid, p_role text, p_name text, p_phone text, p_email text)
+returns text language plpgsql security definer set search_path = public as $$
+declare c text;
+begin
+  if not public.is_manager(ws) then raise exception 'Only managers can invite'; end if;
+  if p_role not in ('manager','rep','office') then raise exception 'Unknown role'; end if;
+  c := upper(substr(replace(gen_random_uuid()::text,'-',''),1,6));
+  insert into invites(code, workspace_id, role, created_by, max_uses, expires_at, name, phone, email)
+  values (c, ws, p_role, auth.uid(), 1, now() + interval '30 days', coalesce(trim(p_name),''), coalesce(trim(p_phone),''), coalesce(lower(trim(p_email)),''));
+  return c;
+end $$;
+
+-- What an invite is for (shown on the welcome screen before joining)
+create or replace function public.invite_info(p_code text)
+returns table(company text, role text, name text)
+language sql stable security definer set search_path = public as $$
+  select w.name, i.role, i.name from invites i join workspaces w on w.id = i.workspace_id
+  where auth.uid() is not null and i.code = upper(trim(p_code)) and i.expires_at >= now() and i.uses < i.max_uses
+$$;
+
 -- Join with an invite code
 create or replace function public.join_workspace(p_code text, p_display_name text)
 returns uuid language plpgsql security definer set search_path = public as $$
@@ -413,8 +438,8 @@ begin
   if auth.uid() is null then raise exception 'Sign in first'; end if;
   select * into inv from invites where code = upper(trim(p_code)) for update;
   if not found or inv.expires_at < now() or inv.uses >= inv.max_uses then raise exception 'That invite code is not valid'; end if;
-  insert into members(workspace_id, user_id, role, display_name)
-  values (inv.workspace_id, auth.uid(), inv.role, coalesce(p_display_name,''))
+  insert into members(workspace_id, user_id, role, display_name, phone)
+  values (inv.workspace_id, auth.uid(), inv.role, coalesce(nullif(trim(p_display_name),''), inv.name, ''), coalesce(inv.phone,''))
   on conflict (workspace_id, user_id) do update
     set role = case when members.active or members.role = 'owner' then members.role else excluded.role end,
         active = true;
@@ -597,6 +622,24 @@ returns setof public.messages language plpgsql stable security definer set searc
 begin
   if public.my_role(ws) is distinct from 'owner' then raise exception 'Only the account owner can export messages'; end if;
   return query select * from messages where workspace_id = ws order by created_at;
+end $$;
+
+-- Owner-only: permanently delete a company (or solo) account and everything in it.
+-- The caller must type the account's exact name. Leads, members, invites, messages, feed,
+-- territories, skip zones and sessions are removed with it (on delete cascade).
+create or replace function public.delete_workspace(ws uuid, p_confirm text)
+returns void language plpgsql security definer set search_path = public as $$
+declare w workspaces;
+begin
+  select * into w from workspaces where id = ws for update;
+  if not found then raise exception 'Account not found'; end if;
+  if w.owner_id is distinct from auth.uid() or public.my_role(ws) is distinct from 'owner' then
+    raise exception 'Only the account owner can delete it';
+  end if;
+  if lower(trim(coalesce(p_confirm,''))) <> lower(trim(w.name)) then
+    raise exception 'Type the exact account name to confirm';
+  end if;
+  delete from workspaces where id = ws;
 end $$;
 
 grant execute on all functions in schema public to authenticated;
