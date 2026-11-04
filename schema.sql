@@ -697,6 +697,8 @@ begin
   end loop;
   delete from blocks where user_id = me or blocked_id = me;
   delete from message_reports where reporter_id = me;
+  delete from push_subs where user_id = me;
+  delete from push_outbox where user_id = me;
   begin
     execute 'delete from auth.users where id = $1' using me;
   exception when others then null;  -- if the project doesn't allow it, the account is still emptied and has no access
@@ -754,4 +756,312 @@ do $$ begin
     execute $p$create policy photos_delete on storage.objects for delete to authenticated
       using (bucket_id = 'photos' and owner = auth.uid())$p$;
   end if;
+end $$;
+
+-- =====================================================================
+-- Push notifications (phone / tablet / computer)
+-- Events below drop a row in push_outbox; the "push" Edge Function sends them.
+-- The function makes its own keys the first time it runs — nothing to paste.
+-- =====================================================================
+do $$ begin
+  begin create extension if not exists pg_net; exception when others then null; end;
+  begin create extension if not exists pg_cron; exception when others then
+    begin create extension if not exists pg_cron with schema pg_catalog; exception when others then null; end;
+  end;
+end $$;
+
+-- One row per device that turned notifications on. prefs: {"messages":false,…} turns a kind off.
+create table if not exists public.push_subs (
+  endpoint   text primary key,
+  user_id    uuid not null,
+  p256dh     text not null,
+  auth       text not null,
+  prefs      jsonb not null default '{}'::jsonb,
+  ua         text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists push_subs_user_idx on public.push_subs(user_id);
+
+create table if not exists public.push_outbox (
+  id         bigserial primary key,
+  user_id    uuid not null,
+  kind       text not null,          -- messages | announce | board | assigned | jobs | followups | test
+  title      text not null,
+  body       text not null default '',
+  url        text not null default './',
+  tag        text not null default '',
+  created_at timestamptz not null default now(),
+  sent_at    timestamptz
+);
+create index if not exists push_outbox_todo_idx on public.push_outbox(id) where sent_at is null;
+
+-- The sending keys (VAPID) and the function's address. Only the server can read this.
+create table if not exists public.push_keys (
+  id          int primary key default 1 check (id = 1),
+  public_key  text not null,
+  private_jwk jsonb not null,
+  fn_url      text not null default '',
+  created_at  timestamptz not null default now()
+);
+
+alter table public.push_subs   enable row level security;
+alter table public.push_outbox enable row level security;
+alter table public.push_keys   enable row level security;
+revoke all on public.push_subs, public.push_outbox, public.push_keys from anon, authenticated;
+do $$ begin
+  execute 'grant all on public.push_subs, public.push_outbox, public.push_keys to service_role';
+  execute 'grant usage, select on sequence public.push_outbox_id_seq to service_role';
+exception when others then null; end $$;
+
+-- ---- for the app (signed-in people) ---------------------------------
+create or replace function public.push_public_key() returns text
+language sql stable security definer set search_path = public as $$
+  select public_key from push_keys where id = 1
+$$;
+
+create or replace function public.push_register(p_endpoint text, p_p256dh text, p_auth text, p_prefs jsonb default null, p_ua text default '')
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare r push_subs;
+begin
+  if auth.uid() is null then raise exception 'Sign in first'; end if;
+  if coalesce(p_endpoint,'') !~ '^https://' or coalesce(p_p256dh,'') = '' or coalesce(p_auth,'') = '' then
+    raise exception 'That device didn''t give a usable notification address';
+  end if;
+  insert into push_subs(endpoint, user_id, p256dh, auth, prefs, ua)
+  values (p_endpoint, auth.uid(), p_p256dh, p_auth, coalesce(p_prefs, '{}'::jsonb), left(coalesce(p_ua,''), 300))
+  on conflict (endpoint) do update set
+    user_id = auth.uid(), p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua,
+    prefs = case when p_prefs is null then push_subs.prefs else excluded.prefs end
+  returning * into r;
+  return jsonb_build_object('prefs', r.prefs);
+end $$;
+
+create or replace function public.push_status(p_endpoint text) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('registered', true, 'prefs', prefs) from push_subs where endpoint = p_endpoint and user_id = auth.uid()
+$$;
+
+create or replace function public.push_set_prefs(p_endpoint text, p_prefs jsonb) returns void
+language sql security definer set search_path = public as $$
+  update push_subs set prefs = coalesce(p_prefs, '{}'::jsonb) where endpoint = p_endpoint and user_id = auth.uid()
+$$;
+
+create or replace function public.push_unregister(p_endpoint text) returns void
+language sql security definer set search_path = public as $$
+  delete from push_subs where endpoint = p_endpoint and user_id = auth.uid()
+$$;
+
+-- ---- internal --------------------------------------------------------
+-- Queue a notification for each person who has it turned on somewhere.
+create or replace function public._push(p_users uuid[], p_kind text, p_title text, p_body text, p_url text, p_tag text)
+returns void language sql security definer set search_path = public as $$
+  insert into push_outbox(user_id, kind, title, body, url, tag)
+  select distinct u, p_kind, left(coalesce(p_title,'Ridgeline'), 120), left(coalesce(p_body,''), 240), coalesce(p_url,'./'), coalesce(p_tag,'')
+  from unnest(coalesce(p_users, '{}'::uuid[])) u
+  where u is not null and exists (select 1 from push_subs s where s.user_id = u and coalesce(s.prefs->>p_kind,'true') <> 'false')
+$$;
+
+-- Wake the Edge Function (after the transaction commits). Quietly does nothing until it's set up.
+create or replace function public._push_wake() returns void
+language plpgsql security definer set search_path = public as $$
+declare u text;
+begin
+  select fn_url into u from push_keys where id = 1;
+  if coalesce(u,'') = '' then return; end if;
+  begin
+    perform net.http_post(url := u, body := '{}'::jsonb, headers := '{"Content-Type":"application/json"}'::jsonb);
+  exception when others then null;
+  end;
+end $$;
+
+create or replace function public._push_outbox_trg() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin perform public._push_wake(); return null; end $$;
+drop trigger if exists push_outbox_wake on public.push_outbox;
+create trigger push_outbox_wake after insert on public.push_outbox for each statement execute function public._push_outbox_trg();
+
+create or replace function public._push_name(ws uuid, u uuid) returns text
+language sql stable security definer set search_path = public as $$
+  select coalesce((select nullif(display_name,'') from members where workspace_id = ws and user_id = u), 'Someone')
+$$;
+
+create or replace function public._push_addr(l leads) returns text
+language sql immutable as $$
+  select coalesce(nullif(trim(l.num || ' ' || l.street), ''), nullif(l.name, ''), 'a lead')
+$$;
+
+-- New chat messages
+create or replace function public._push_on_message() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare who text := public._push_name(new.workspace_id, new.sender_id); rcpt uuid[]; ttl text; b text; u text := './#team'; k text := 'messages'; l leads;
+begin
+  b := case when coalesce(new.body,'') <> '' then left(new.body, 200) when new.image_path is not null then '📷 Photo' else '' end;
+  if new.channel = 'dm' then
+    rcpt := array(select x from unnest(new.participants) x where x <> new.sender_id);
+    ttl := who;
+  elsif new.channel = 'lead' then
+    select * into l from leads where id = new.lead_id and workspace_id = new.workspace_id;
+    rcpt := array(select distinct x from (
+              select l.owner_id as x
+              union select sender_id from messages where workspace_id = new.workspace_id and thread = new.thread) s
+            where x is not null and x <> new.sender_id);
+    ttl := who || ' · ' || coalesce(public._push_addr(l), 'a lead');
+    u := './?lead=' || coalesce(new.lead_id,'') || '#leads';
+  else
+    rcpt := array(select user_id from members where workspace_id = new.workspace_id and active and user_id <> new.sender_id);
+    if new.channel = 'announce' then ttl := '📣 ' || who; k := 'announce'; else ttl := who || ' · Team chat'; end if;
+  end if;
+  rcpt := array(select x from unnest(rcpt) x
+                where exists (select 1 from members where workspace_id = new.workspace_id and user_id = x and active)
+                  and not exists (select 1 from blocks where user_id = x and blocked_id = new.sender_id));
+  perform public._push(rcpt, k, ttl, b, u, 'msg:' || new.thread);
+  return null;
+end $$;
+drop trigger if exists push_on_message on public.messages;
+create trigger push_on_message after insert on public.messages for each row execute function public._push_on_message();
+
+-- Leads: posted to the board, handed to a rep, or changed by someone else
+create or replace function public._push_on_lead() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare actor uuid := auth.uid(); a text := public._push_addr(new); who text; u text := './?lead=' || new.id || '#leads';
+        nlog int; olog int; last jsonb; job text := nullif(new.data->'post'->>'job','');
+begin
+  if new.city <> '' then a := a || ', ' || new.city; end if;
+  if new.pool and (tg_op = 'INSERT' or not old.pool) then
+    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active
+                                 and role in ('owner','manager','rep') and user_id is distinct from coalesce(actor, new.posted_by)),
+                         'board', 'New open lead', a || coalesce(' · ' || job, ''), './#board', 'board:' || new.id);
+  end if;
+  if new.owner_id is null or not exists (select 1 from members where workspace_id = new.workspace_id and user_id = new.owner_id and active) then
+    return null;
+  end if;
+  if new.owner_id is distinct from actor and (tg_op = 'INSERT' or old.owner_id is distinct from new.owner_id) then
+    who := case when actor is null then 'the office' else public._push_name(new.workspace_id, actor) end;
+    perform public._push(array[new.owner_id], 'assigned', 'Lead assigned to you', a || ' · from ' || who, u, 'lead:' || new.id);
+  elsif tg_op = 'UPDATE' and actor is not null and actor <> new.owner_id and old.owner_id is not distinct from new.owner_id then
+    who := public._push_name(new.workspace_id, actor);
+    if new.status is distinct from old.status then
+      perform public._push(array[new.owner_id], 'jobs', who || ' updated ' || a, 'Status: ' || new.status, u, 'lead:' || new.id);
+    else
+      nlog := case when jsonb_typeof(new.data->'log') = 'array' then jsonb_array_length(new.data->'log') else 0 end;
+      olog := case when jsonb_typeof(old.data->'log') = 'array' then jsonb_array_length(old.data->'log') else 0 end;
+      if nlog > olog then
+        last := new.data->'log'->(nlog - 1);
+        if coalesce(last->>'text','') <> '' then
+          perform public._push(array[new.owner_id], 'jobs', 'Note from ' || who || ' · ' || a, left(last->>'text', 200), u, 'lead:' || new.id);
+        end if;
+      end if;
+    end if;
+  end if;
+  return null;
+end $$;
+drop trigger if exists push_on_lead on public.leads;
+create trigger push_on_lead after insert or update on public.leads for each row execute function public._push_on_lead();
+
+-- Morning reminder: follow-ups due today (and any overdue) for each rep
+create or replace function public.push_followups() returns int
+language plpgsql security definer set search_path = public as $$
+declare r record; n int := 0;
+begin
+  for r in
+    select l.owner_id, count(*) as c,
+           count(*) filter (where left(l.follow_at,10) < to_char(now() at time zone coalesce(nullif(w.settings->>'tz',''),'America/New_York'),'YYYY-MM-DD')) as late,
+           (array_agg(public._push_addr(l) order by l.follow_at))[1] as first
+      from leads l
+      join workspaces w on w.id = l.workspace_id
+      join members m on m.workspace_id = l.workspace_id and m.user_id = l.owner_id and m.active
+     where l.owner_id is not null and l.follow_at <> ''
+       and l.status not in ('Not Interested','No Damage','Cancelled','Finance Denied')
+       and left(l.follow_at,10) <= to_char(now() at time zone coalesce(nullif(w.settings->>'tz',''),'America/New_York'),'YYYY-MM-DD')
+     group by l.owner_id
+  loop
+    perform public._push(array[r.owner_id], 'followups',
+      case when r.c = 1 then '1 follow-up due today' else r.c || ' follow-ups due today' end,
+      r.first || case when r.c > 1 then ' and ' || (r.c - 1) || ' more' else '' end || case when r.late > 0 then ' (' || r.late || ' overdue)' else '' end,
+      './#followups', 'followups');
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+
+-- Safety net: if anything is still waiting, wake the function again.
+create or replace function public.push_retry() returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if exists (select 1 from push_outbox where sent_at is null and created_at > now() - interval '1 day') then perform public._push_wake(); end if;
+end $$;
+
+-- Send yourself a test
+create or replace function public.push_test() returns int
+language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  if auth.uid() is null then raise exception 'Sign in first'; end if;
+  select count(*) into n from push_subs where user_id = auth.uid();
+  if n = 0 then raise exception 'Turn on notifications on this device first'; end if;
+  insert into push_outbox(user_id, kind, title, body, url, tag)
+  values (auth.uid(), 'test', 'Ridgeline notifications are on', 'This is what a notification looks like.', './#home', 'test');
+  return n;
+end $$;
+
+-- ---- for the Edge Function only (service role) ----------------------
+create or replace function public.push_init(p_public text, p_private jsonb, p_url text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k push_keys;
+begin
+  select * into k from push_keys where id = 1;
+  if not found then
+    if p_public is null then raise exception 'no keys'; end if;
+    insert into push_keys(id, public_key, private_jwk, fn_url) values (1, p_public, p_private, coalesce(p_url,''))
+    on conflict (id) do nothing;
+    select * into k from push_keys where id = 1;
+  end if;
+  if coalesce(p_url,'') <> '' and k.fn_url is distinct from p_url then
+    update push_keys set fn_url = p_url where id = 1 returning * into k;
+  end if;
+  return jsonb_build_object('public_key', k.public_key, 'private_jwk', k.private_jwk, 'fn_url', k.fn_url);
+end $$;
+
+create or replace function public.push_claim(p_limit int default 200) returns setof public.push_outbox
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from push_outbox where created_at < now() - interval '7 days';
+  return query
+    update push_outbox o set sent_at = now()
+     where o.id in (select id from push_outbox where sent_at is null and created_at > now() - interval '1 day'
+                     order by id limit greatest(1, least(coalesce(p_limit,200), 500)) for update skip locked)
+    returning o.*;
+end $$;
+
+create or replace function public.push_targets(p_users uuid[]) returns setof public.push_subs
+language sql stable security definer set search_path = public as $$
+  select * from push_subs where user_id = any(p_users)
+$$;
+
+create or replace function public.push_drop(p_endpoints text[]) returns void
+language sql security definer set search_path = public as $$
+  delete from push_subs where endpoint = any(p_endpoints)
+$$;
+
+revoke execute on function public._push(uuid[], text, text, text, text, text) from public, anon, authenticated;
+revoke execute on function public._push_wake() from public, anon, authenticated;
+revoke execute on function public._push_name(uuid, uuid) from public, anon, authenticated;
+revoke execute on function public.push_followups() from public, anon, authenticated;
+revoke execute on function public.push_retry() from public, anon, authenticated;
+revoke execute on function public.push_init(text, jsonb, text) from public, anon, authenticated;
+revoke execute on function public.push_claim(int) from public, anon, authenticated;
+revoke execute on function public.push_targets(uuid[]) from public, anon, authenticated;
+revoke execute on function public.push_drop(text[]) from public, anon, authenticated;
+do $$ begin
+  execute 'grant execute on function public.push_init(text, jsonb, text), public.push_claim(int), public.push_targets(uuid[]), public.push_drop(text[]) to service_role';
+exception when others then null; end $$;
+
+-- Schedules: follow-up reminders every morning at 8 AM Eastern (1 PM UTC), and a retry every 10 minutes.
+do $$ begin
+  begin perform cron.unschedule('ridgeline-followups'); exception when others then null; end;
+  begin perform cron.unschedule('ridgeline-push-retry'); exception when others then null; end;
+  begin
+    perform cron.schedule('ridgeline-followups', '0 13 * * *', 'select public.push_followups()');
+    perform cron.schedule('ridgeline-push-retry', '*/10 * * * *', 'select public.push_retry()');
+  exception when others then null; end;
 end $$;
