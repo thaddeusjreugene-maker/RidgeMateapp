@@ -600,6 +600,10 @@ begin
 end $$;
 
 grant execute on all functions in schema public to authenticated;
+-- Table access for signed-in users. Row-level security above still decides which rows each person can see or change.
+-- (Needed when the project was created with "Automatically expose new tables" turned off.)
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on all tables in schema public to authenticated;
 
 -- ---------------------------------------------------------------------
 -- Live updates (chat, feed, board) — Supabase Realtime
