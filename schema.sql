@@ -624,34 +624,28 @@ begin
   return query select * from messages where workspace_id = ws order by created_at;
 end $$;
 
--- Managers: permanently remove a person from the company.
--- Their open leads and pins go to the Open Leads board for the team to claim; sold or closed jobs
--- stay with the company under the manager doing the delete. Their messages, feed posts, reactions,
--- knocking sessions and the invites they made are deleted, and they lose all access.
-create or replace function public.delete_member(ws uuid, p_user uuid, p_confirm text)
+-- Internal: take one person out of a workspace. Their open leads and pins go to the Open Leads
+-- board; sold or closed jobs go to p_actor; their messages, posts, reactions, sessions and invites
+-- are deleted; their skip zones are kept under p_actor; they come off every territory.
+-- Not callable from the app directly (see the revoke near the end).
+create or replace function public._remove_member(ws uuid, p_user uuid, p_actor uuid)
 returns jsonb language plpgsql security definer set search_path = public as $$
-declare m members; nb int := 0; nk int := 0; ms bigint := (extract(epoch from now())*1000)::bigint;
+declare nm text; nb int := 0; nk int := 0; ms bigint := (extract(epoch from now())*1000)::bigint;
 begin
-  if not public.is_manager(ws) then raise exception 'Only managers can delete people'; end if;
-  select * into m from members where workspace_id = ws and user_id = p_user for update;
-  if not found then raise exception 'Person not found'; end if;
-  if m.role = 'owner' then raise exception 'The account owner can''t be deleted'; end if;
-  if p_user = auth.uid() then raise exception 'You can''t delete yourself'; end if;
-  if lower(trim(coalesce(p_confirm,''))) <> lower(trim(coalesce(nullif(m.display_name,''),'delete'))) then
-    raise exception 'Type their exact name to confirm';
-  end if;
-  update leads set owner_id = auth.uid(), updated_at = now(),
+  select coalesce(nullif(display_name,''),'a teammate') into nm from members where workspace_id = ws and user_id = p_user;
+  nm := coalesce(nm, 'a teammate');
+  update leads set owner_id = p_actor, updated_at = now(),
          data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) || jsonb_build_array(
-                jsonb_build_object('t', ms, 'r', 'Reassigned', 'by', auth.uid(), 'from', p_user, 'note', m.display_name || ' was removed')))
+                jsonb_build_object('t', ms, 'r', 'Reassigned', 'by', p_actor, 'from', p_user, 'note', nm || ' was removed')))
    where workspace_id = ws and owner_id = p_user and status in ('Sold','Cancelled','Finance Denied');
   get diagnostics nk = row_count;
-  update leads set owner_id = null, pool = true, origin = 'company', posted_by = auth.uid(), posted_at = now(),
+  update leads set owner_id = null, pool = true, origin = 'company', posted_by = p_actor, posted_at = now(),
          claimed_at = null, contacted_at = null, protected_until = null, updated_at = now(),
          data = jsonb_set(jsonb_set(data, '{post}', jsonb_build_object(
                   'job', 'Follow up', 'insurance', coalesce(data->'sale'->>'type','') = 'Insurance', 'window', '',
-                  'source', 'Was ' || coalesce(nullif(m.display_name,''),'a teammate') || '''s', 'public_notes', 'Last status: ' || status)),
+                  'source', 'Was ' || nm || '''s', 'public_notes', 'Last status: ' || status)),
                 '{knocks}', coalesce(data->'knocks','[]'::jsonb) || jsonb_build_array(
-                  jsonb_build_object('t', ms, 'r', 'Returned to board', 'by', auth.uid(), 'from', p_user, 'note', m.display_name || ' was removed')))
+                  jsonb_build_object('t', ms, 'r', 'Returned to board', 'by', p_actor, 'from', p_user, 'note', nm || ' was removed')))
    where workspace_id = ws and owner_id = p_user;
   get diagnostics nb = row_count;
   delete from reactions r using feed f where f.id = r.feed_id and f.workspace_id = ws and r.user_id = p_user;
@@ -660,10 +654,53 @@ begin
   delete from message_reads where workspace_id = ws and user_id = p_user;
   delete from knock_sessions where workspace_id = ws and user_id = p_user;
   delete from invites where workspace_id = ws and created_by = p_user;
-  update skip_zones set created_by = auth.uid() where workspace_id = ws and created_by = p_user;
+  update skip_zones set created_by = p_actor where workspace_id = ws and created_by = p_user;
   update territories set rep_ids = array_remove(rep_ids, p_user) where workspace_id = ws;
   delete from members where workspace_id = ws and user_id = p_user;
   return jsonb_build_object('board', nb, 'kept', nk);
+end $$;
+
+-- Managers: permanently remove a person from the company (they must type the person's name).
+create or replace function public.delete_member(ws uuid, p_user uuid, p_confirm text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare m members;
+begin
+  if not public.is_manager(ws) then raise exception 'Only managers can delete people'; end if;
+  select * into m from members where workspace_id = ws and user_id = p_user for update;
+  if not found then raise exception 'Person not found'; end if;
+  if m.role = 'owner' then raise exception 'The account owner can''t be deleted'; end if;
+  if p_user = auth.uid() then raise exception 'You can''t delete yourself here — use Delete my account'; end if;
+  if lower(trim(coalesce(p_confirm,''))) <> lower(trim(coalesce(nullif(m.display_name,''),'delete'))) then
+    raise exception 'Type their exact name to confirm';
+  end if;
+  return public._remove_member(ws, p_user, auth.uid());
+end $$;
+
+-- Anyone: delete your own Ridgeline account. Solo accounts (and companies where you're the only
+-- person) are deleted; in other companies you're removed like a deleted rep, with your open leads
+-- going to that company's Open Leads board. If you own a company that still has a team, you must
+-- delete that company first. Finally the sign-in itself is removed.
+create or replace function public.delete_my_account(p_confirm text)
+returns void language plpgsql security definer set search_path = public as $$
+declare me uuid := auth.uid(); w record;
+begin
+  if me is null then raise exception 'Sign in first'; end if;
+  if upper(trim(coalesce(p_confirm,''))) <> 'DELETE' then raise exception 'Type DELETE to confirm'; end if;
+  for w in select ws.id, ws.name from workspaces ws join members m on m.workspace_id = ws.id and m.user_id = me where m.role = 'owner' loop
+    if exists(select 1 from members where workspace_id = w.id and user_id <> me) then
+      raise exception 'You own % — delete that company first (Settings → Delete this company)', w.name;
+    end if;
+  end loop;
+  delete from workspaces where id in (select workspace_id from members where user_id = me and role = 'owner');
+  for w in select m.workspace_id, ws.owner_id from members m join workspaces ws on ws.id = m.workspace_id where m.user_id = me loop
+    perform public._remove_member(w.workspace_id, me, w.owner_id);
+  end loop;
+  delete from blocks where user_id = me or blocked_id = me;
+  delete from message_reports where reporter_id = me;
+  begin
+    execute 'delete from auth.users where id = $1' using me;
+  exception when others then null;  -- if the project doesn't allow it, the account is still emptied and has no access
+  end;
 end $$;
 
 -- Owner-only: permanently delete a company (or solo) account and everything in it.
@@ -688,6 +725,7 @@ grant execute on all functions in schema public to authenticated;
 -- Table access for signed-in users. Row-level security above still decides which rows each person can see or change.
 -- (Needed when the project was created with "Automatically expose new tables" turned off.)
 grant usage on schema public to authenticated;
+revoke execute on function public._remove_member(uuid, uuid, uuid) from public, anon, authenticated;
 grant select, insert, update, delete on all tables in schema public to authenticated;
 
 -- ---------------------------------------------------------------------
