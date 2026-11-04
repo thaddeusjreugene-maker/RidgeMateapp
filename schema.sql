@@ -624,6 +624,48 @@ begin
   return query select * from messages where workspace_id = ws order by created_at;
 end $$;
 
+-- Managers: permanently remove a person from the company.
+-- Their open leads and pins go to the Open Leads board for the team to claim; sold or closed jobs
+-- stay with the company under the manager doing the delete. Their messages, feed posts, reactions,
+-- knocking sessions and the invites they made are deleted, and they lose all access.
+create or replace function public.delete_member(ws uuid, p_user uuid, p_confirm text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare m members; nb int := 0; nk int := 0; ms bigint := (extract(epoch from now())*1000)::bigint;
+begin
+  if not public.is_manager(ws) then raise exception 'Only managers can delete people'; end if;
+  select * into m from members where workspace_id = ws and user_id = p_user for update;
+  if not found then raise exception 'Person not found'; end if;
+  if m.role = 'owner' then raise exception 'The account owner can''t be deleted'; end if;
+  if p_user = auth.uid() then raise exception 'You can''t delete yourself'; end if;
+  if lower(trim(coalesce(p_confirm,''))) <> lower(trim(coalesce(nullif(m.display_name,''),'delete'))) then
+    raise exception 'Type their exact name to confirm';
+  end if;
+  update leads set owner_id = auth.uid(), updated_at = now(),
+         data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) || jsonb_build_array(
+                jsonb_build_object('t', ms, 'r', 'Reassigned', 'by', auth.uid(), 'from', p_user, 'note', m.display_name || ' was removed')))
+   where workspace_id = ws and owner_id = p_user and status in ('Sold','Cancelled','Finance Denied');
+  get diagnostics nk = row_count;
+  update leads set owner_id = null, pool = true, origin = 'company', posted_by = auth.uid(), posted_at = now(),
+         claimed_at = null, contacted_at = null, protected_until = null, updated_at = now(),
+         data = jsonb_set(jsonb_set(data, '{post}', jsonb_build_object(
+                  'job', 'Follow up', 'insurance', coalesce(data->'sale'->>'type','') = 'Insurance', 'window', '',
+                  'source', 'Was ' || coalesce(nullif(m.display_name,''),'a teammate') || '''s', 'public_notes', 'Last status: ' || status)),
+                '{knocks}', coalesce(data->'knocks','[]'::jsonb) || jsonb_build_array(
+                  jsonb_build_object('t', ms, 'r', 'Returned to board', 'by', auth.uid(), 'from', p_user, 'note', m.display_name || ' was removed')))
+   where workspace_id = ws and owner_id = p_user;
+  get diagnostics nb = row_count;
+  delete from reactions r using feed f where f.id = r.feed_id and f.workspace_id = ws and r.user_id = p_user;
+  delete from feed where workspace_id = ws and user_id = p_user;
+  delete from messages where workspace_id = ws and (sender_id = p_user or (channel = 'dm' and p_user = any(participants)));
+  delete from message_reads where workspace_id = ws and user_id = p_user;
+  delete from knock_sessions where workspace_id = ws and user_id = p_user;
+  delete from invites where workspace_id = ws and created_by = p_user;
+  update skip_zones set created_by = auth.uid() where workspace_id = ws and created_by = p_user;
+  update territories set rep_ids = array_remove(rep_ids, p_user) where workspace_id = ws;
+  delete from members where workspace_id = ws and user_id = p_user;
+  return jsonb_build_object('board', nb, 'kept', nk);
+end $$;
+
 -- Owner-only: permanently delete a company (or solo) account and everything in it.
 -- The caller must type the account's exact name. Leads, members, invites, messages, feed,
 -- territories, skip zones and sessions are removed with it (on delete cascade).
