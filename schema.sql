@@ -1065,3 +1065,30 @@ do $$ begin
     perform cron.schedule('ridgeline-push-retry', '*/10 * * * *', 'select public.push_retry()');
   exception when others then null; end;
 end $$;
+
+-- =====================================================================
+-- Delete a whole chat. Direct messages: either person in the conversation (gone for both).
+-- Team chat, announcements, lead chats: managers only. Returns the photo paths that were in it.
+-- =====================================================================
+create or replace function public.delete_thread(ws uuid, p_thread text) returns text[]
+language plpgsql security definer set search_path = public as $$
+declare paths text[]; parts text[];
+begin
+  if auth.uid() is null or not public.is_member(ws) then raise exception 'Not allowed'; end if;
+  if p_thread like 'dm:%' then
+    parts := string_to_array(substr(p_thread, 4), ':');
+    if not (auth.uid()::text = any(parts)) then raise exception 'You can only delete your own conversations'; end if;
+  elsif not public.is_manager(ws) then
+    raise exception 'Only managers can clear this chat';
+  end if;
+  select coalesce(array_agg(image_path) filter (where image_path is not null), '{}') into paths
+    from messages where workspace_id = ws and thread = p_thread;
+  delete from messages where workspace_id = ws and thread = p_thread;
+  delete from message_reads where workspace_id = ws and thread = p_thread;
+  delete from push_outbox where tag = 'msg:' || p_thread and sent_at is null;
+  if cardinality(paths) > 0 and exists (select 1 from pg_namespace where nspname = 'storage') then
+    begin execute 'delete from storage.objects where bucket_id = ''photos'' and name = any($1)' using paths;
+    exception when others then null; end;
+  end if;
+  return paths;
+end $$;
