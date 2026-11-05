@@ -1,11 +1,11 @@
-// Ridgeline Teams — notification helper (service worker). Upload next to index.html.
+// RidgeMate Teams — notification helper (service worker). Upload next to index.html.
 const PUSH_ICON = 'icon-192.png';
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('push', e => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
-  e.waitUntil(self.registration.showNotification(d.title || 'Ridgeline', {
+  e.waitUntil(self.registration.showNotification(d.title || 'RidgeMate', {
     body: d.body || '', tag: d.tag || undefined, renotify: !!d.tag,
     icon: PUSH_ICON, badge: PUSH_ICON, data: { url: d.url || './' }
   }));
