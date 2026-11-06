@@ -1350,6 +1350,8 @@ body[data-view="storms"] .fab,body[data-view="tools"] .fab{display:none}
 .bill-strip.bad .bill-cta{color:var(--danger)}
 .code-box summary{cursor:pointer;color:var(--accent);font-weight:700;font-size:14px;list-style:none}
 .code-box summary::-webkit-details-marker{display:none}
+/* sign-in / onboarding screens have no side rail, so don't reserve room for it */
+@media (min-width:760px){body.auth{--rail:0px;padding-left:0}}
 </style>
 </head>
 <body>
