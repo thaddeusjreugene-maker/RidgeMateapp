@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Roof inspection</title>
+<style>
+html,body{margin:0;height:100%;background:#F2F2F7;color:#111;font-family:-apple-system,system-ui,sans-serif}
+#f{position:fixed;inset:0;width:100%;height:100%;border:0;background:#F2F2F7}
+.msg{max-width:420px;margin:22vh auto 0;padding:0 20px;text-align:center}
+.msg h1{font-size:22px;margin:0 0 8px}.msg p{margin:0;color:#6B6B70;font-size:15px;line-height:1.5}
+</style>
+<script src="config.js"></script>
+</head>
+<body>
+<div class="msg" id="m"><p>Loading…</p></div>
+<script>
+(function(){
+  var CSS=".sp-page{max-width:680px;margin:0 auto;padding:22px max(16px,env(safe-area-inset-left,0px)) 40px;display:flex;flex-direction:column;gap:16px;font-family:Inter,-apple-system,system-ui,sans-serif}\n.sp-head{display:flex;justify-content:space-between;align-items:center;gap:10px}\n.sp-co{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px}\n.sp-mark{width:26px;height:26px;border-radius:7px;background:#2F6BFF}\n.sp-kind{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#8E8E93}\n.sp-page h1{margin:4px 0 0;font-size:28px;line-height:1.15;letter-spacing:-.02em;text-wrap:balance}\n.sp-sub{margin:-8px 0 0;color:#6B6B70;font-size:14.5px}\n.sp-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(74px,1fr));gap:8px}\n.sp-stats div{background:#fff;border-radius:14px;padding:12px 14px;display:flex;flex-direction:column}\n.sp-stats b{font-size:26px;font-weight:800;letter-spacing:-.02em}.sp-stats span{font-size:12.5px;color:#6B6B70;font-weight:600}\n.sp-lede{margin:0;font-size:16px;line-height:1.5}\n.sp-card{background:#fff;border-radius:16px;padding:14px 16px;display:flex;flex-direction:column}\n.sp-card h2,.sp-sec h2{margin:0 0 6px;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#8E8E93}\n.sp-card p{margin:0;font-size:15px;line-height:1.5}\n.sp-kv{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid #EFEFF4;font-size:15px}.sp-kv:first-of-type{border-top:0}.sp-kv span{color:#6B6B70}\n.sp-sec{display:flex;flex-direction:column;gap:10px}.sp-sec h2 span{color:#C7C7CC;margin-left:4px}\n.sp-fig{margin:0;background:#fff;border-radius:16px;overflow:hidden}\n.sp-img{position:relative;line-height:0}.sp-img img,.sp-fig video{width:100%;display:block;background:#000}\n.sp-pin{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;border:3px solid var(--mc);box-shadow:0 0 0 2px rgba(255,255,255,.85)}\n.sp-fig figcaption{padding:10px 14px 12px;font-size:14.5px;line-height:1.45;display:flex;flex-direction:column;gap:6px}\n.sp-tags{display:flex;gap:6px;flex-wrap:wrap}.sp-tags i{font-style:normal;font-size:12px;font-weight:700;color:var(--mc);background:color-mix(in srgb,var(--mc) 12%,#fff);padding:3px 8px;border-radius:999px}\n.sp-foot{text-align:center;font-size:13px;color:#8E8E93;padding-top:8px}.sp-foot span{font-size:12px;color:#B0B0B5}";
+  var m=document.getElementById('m');
+  function fail(t,s){m.innerHTML='<h1></h1><p></p>';m.querySelector('h1').textContent=t;m.querySelector('p').textContent=s||''}
+  var tok=(location.hash||'').replace(/^#/,'').replace(/[^0-9a-zA-Z]/g,'');
+  var C=window.RIDGELINE_CONFIG||{};
+  if(!tok){fail('Link not found','Check the link and try again.');return}
+  if(!C.supabaseUrl||!C.supabaseAnonKey){fail('Not available','This link can\u2019t be opened right now.');return}
+  fetch(C.supabaseUrl.replace(/\/$/,'')+'/rest/v1/rpc/get_share',{method:'POST',headers:{'Content-Type':'application/json',apikey:C.supabaseAnonKey,Authorization:'Bearer '+C.supabaseAnonKey},body:JSON.stringify({p_token:tok})})
+  .then(function(r){if(!r.ok)throw new Error('http '+r.status);return r.json()})
+  .then(function(p){
+    if(!p||!p.html){fail('This link has expired','Ask your roofer to send a new one.');return}
+    if(p.title)document.title=(p.co?p.co+' \u00b7 ':'')+p.title;
+    var f=document.createElement('iframe');f.id='f';f.title=document.title;
+    f.setAttribute('sandbox','allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation');
+    f.srcdoc='<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><base target="_blank"><style>body{margin:0;background:#F2F2F7;color:#111}'+CSS+'</style></head><body>'+p.html+'</body></html>';
+    m.remove();document.body.appendChild(f)})
+  .catch(function(){fail('Couldn\u2019t load','Check your connection and try again.')});
+})();
+</script>
+</body>
+</html>
