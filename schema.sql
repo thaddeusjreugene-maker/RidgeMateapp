@@ -1,5 +1,5 @@
 -- =====================================================================
--- Ridgeline Teams — database schema for Supabase (Postgres)
+-- RidgeMate Teams — database schema for Supabase (Postgres)
 -- Run this whole file once in Supabase: SQL Editor → New query → paste → Run.
 -- It is safe to re-run: objects are created "if not exists" / replaced.
 -- =====================================================================
@@ -30,6 +30,14 @@ create table if not exists public.members (
   primary key (workspace_id, user_id)
 );
 create index if not exists members_user_idx on public.members(user_id);
+-- RUVA support staff, only while the owner has allowed support access
+alter table public.members add column if not exists support boolean not null default false;
+create table if not exists public.support_grants (
+  workspace_id uuid primary key references public.workspaces(id) on delete cascade,
+  granted_by   uuid,
+  expires_at   timestamptz not null,
+  created_at   timestamptz not null default now()
+);
 
 create table if not exists public.invites (
   code         text primary key,
@@ -174,11 +182,13 @@ create table if not exists public.blocks (
 -- ---------------------------------------------------------------------
 create or replace function public.my_role(ws uuid) returns text
 language sql stable security definer set search_path = public as $$
-  select role from members where workspace_id = ws and user_id = auth.uid() and active
+  select role from members m where m.workspace_id = ws and m.user_id = auth.uid() and m.active
+    and (not m.support or exists(select 1 from support_grants g where g.workspace_id = ws and g.expires_at > now()))
 $$;
 create or replace function public.is_member(ws uuid) returns boolean
 language sql stable security definer set search_path = public as $$
-  select exists(select 1 from members where workspace_id = ws and user_id = auth.uid() and active)
+  select exists(select 1 from members m where m.workspace_id = ws and m.user_id = auth.uid() and m.active
+    and (not m.support or exists(select 1 from support_grants g where g.workspace_id = ws and g.expires_at > now())))
 $$;
 create or replace function public.is_manager(ws uuid) returns boolean
 language sql stable security definer set search_path = public as $$
@@ -268,9 +278,11 @@ create policy lead_insert on public.leads for insert
   with check (public.is_member(workspace_id) and created_by = auth.uid()
               and ((owner_id = auth.uid() and not pool) or (owner_id is null and pool and public.can_view_all(workspace_id))
                    or public.is_manager(workspace_id)));
+-- Owners/managers and office staff can edit any lead's details (office attaches measurement reports, fixes info);
+-- only owners/managers can change who owns a lead or its board status (leads_guard below).
 create policy lead_update on public.leads for update
-  using (public.is_manager(workspace_id) or (public.is_member(workspace_id) and owner_id = auth.uid()))
-  with check (public.is_manager(workspace_id) or (public.is_member(workspace_id) and owner_id = auth.uid() and not pool));
+  using (public.can_view_all(workspace_id) or (public.is_member(workspace_id) and owner_id = auth.uid()))
+  with check (public.can_view_all(workspace_id) or (public.is_member(workspace_id) and owner_id = auth.uid() and not pool));
 
 -- Reps editing their own lead can't touch board/claim bookkeeping (owner, origin, pool, claim time…);
 -- those change only through claim_lead / release_lead / assign_lead / take_over_door, or by a manager.
@@ -278,6 +290,13 @@ create or replace function public.leads_guard() returns trigger
 language plpgsql set search_path = public as $$
 begin
   if current_user not in ('authenticated','anon') then return new; end if;
+  -- Reports the owner, a manager or the office attached can only be removed by them, not by the rep
+  if not public.can_view_all(old.workspace_id) and exists (
+       select 1 from jsonb_array_elements(case when jsonb_typeof(old.data->'docs') = 'array' then old.data->'docs' else '[]'::jsonb end) d
+       where coalesce(d->>'staff','') = 'true'
+         and not (case when jsonb_typeof(new.data->'docs') = 'array' then new.data->'docs' else '[]'::jsonb end) @> jsonb_build_array(jsonb_build_object('id', d->'id'))) then
+    raise exception 'Only the office can remove a report it attached';
+  end if;
   if public.is_manager(old.workspace_id) and public.is_manager(new.workspace_id) then return new; end if;
   if new.workspace_id is distinct from old.workspace_id or new.owner_id is distinct from old.owner_id
      or new.created_by is distinct from old.created_by or new.origin is distinct from old.origin
@@ -606,7 +625,7 @@ language sql stable security definer set search_path = public as $$
     coalesce((select count(*) from k where k.uid = m.user_id and k.r = 'Inspected' and k.at between p_from and p_to),0)::int,
     coalesce(s.sales,0)::int, coalesce(s.volume,0)
   from members m left join s on s.uid = m.user_id
-  where m.workspace_id = ws and m.active and public.is_member(ws)
+  where m.workspace_id = ws and m.active and not m.support and public.is_member(ws)
 $$;
 
 -- Who has read the latest announcement
@@ -676,7 +695,7 @@ begin
   return public._remove_member(ws, p_user, auth.uid());
 end $$;
 
--- Anyone: delete your own Ridgeline account. Solo accounts (and companies where you're the only
+-- Anyone: delete your own RidgeMate account. Solo accounts (and companies where you're the only
 -- person) are deleted; in other companies you're removed like a deleted rep, with your open leads
 -- going to that company's Open Leads board. If you own a company that still has a team, you must
 -- delete that company first. Finally the sign-in itself is removed.
@@ -687,7 +706,7 @@ begin
   if me is null then raise exception 'Sign in first'; end if;
   if upper(trim(coalesce(p_confirm,''))) <> 'DELETE' then raise exception 'Type DELETE to confirm'; end if;
   for w in select ws.id, ws.name from workspaces ws join members m on m.workspace_id = ws.id and m.user_id = me where m.role = 'owner' loop
-    if exists(select 1 from members where workspace_id = w.id and user_id <> me) then
+    if exists(select 1 from members where workspace_id = w.id and user_id <> me and not support) then
       raise exception 'You own % — delete that company first (Settings → Delete this company)', w.name;
     end if;
   end loop;
@@ -754,7 +773,7 @@ do $$ begin
     execute $p$create policy photos_write on storage.objects for insert to authenticated
       with check (bucket_id = 'photos' and public.is_member((split_part(name,'/',1))::uuid))$p$;
     execute $p$create policy photos_delete on storage.objects for delete to authenticated
-      using (bucket_id = 'photos' and owner = auth.uid())$p$;
+      using (bucket_id = 'photos' and (owner = auth.uid() or public.can_view_all((split_part(name,'/',1))::uuid)))$p$;
   end if;
 end $$;
 
@@ -856,7 +875,7 @@ $$;
 create or replace function public._push(p_users uuid[], p_kind text, p_title text, p_body text, p_url text, p_tag text)
 returns void language sql security definer set search_path = public as $$
   insert into push_outbox(user_id, kind, title, body, url, tag)
-  select distinct u, p_kind, left(coalesce(p_title,'Ridgeline'), 120), left(coalesce(p_body,''), 240), coalesce(p_url,'./'), coalesce(p_tag,'')
+  select distinct u, p_kind, left(coalesce(p_title,'RUVA'), 120), left(coalesce(p_body,''), 240), coalesce(p_url,'./'), coalesce(p_tag,'')
   from unnest(coalesce(p_users, '{}'::uuid[])) u
   where u is not null and exists (select 1 from push_subs s where s.user_id = u and coalesce(s.prefs->>p_kind,'true') <> 'false')
 $$;
@@ -908,11 +927,11 @@ begin
     ttl := who || ' · ' || coalesce(public._push_addr(l), 'a lead');
     u := './?lead=' || coalesce(new.lead_id,'') || '#leads';
   else
-    rcpt := array(select user_id from members where workspace_id = new.workspace_id and active and user_id <> new.sender_id);
+    rcpt := array(select user_id from members where workspace_id = new.workspace_id and active and not support and user_id <> new.sender_id);
     if new.channel = 'announce' then ttl := '📣 ' || who; k := 'announce'; else ttl := who || ' · Team chat'; end if;
   end if;
   rcpt := array(select x from unnest(rcpt) x
-                where exists (select 1 from members where workspace_id = new.workspace_id and user_id = x and active)
+                where exists (select 1 from members where workspace_id = new.workspace_id and user_id = x and active and not support)
                   and not exists (select 1 from blocks where user_id = x and blocked_id = new.sender_id));
   perform public._push(rcpt, k, ttl, b, u, 'msg:' || new.thread);
   return null;
@@ -928,9 +947,64 @@ declare actor uuid := auth.uid(); a text := public._push_addr(new); who text; u 
 begin
   if new.city <> '' then a := a || ', ' || new.city; end if;
   if new.pool and (tg_op = 'INSERT' or not old.pool) then
-    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active
+    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active and not support
                                  and role in ('owner','manager','rep') and user_id is distinct from coalesce(actor, new.posted_by)),
                          'board', 'New open lead', a || coalesce(' · ' || job, ''), './#board', 'board:' || new.id);
+  end if;
+  -- A rep asked the office to order measurements
+  if tg_op = 'UPDATE' and coalesce(new.data->'meas'->>'st','') = 'requested'
+     and coalesce(old.data->'meas'->>'st','') <> 'requested' then
+    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active and not support
+                                 and role in ('owner','manager','office') and user_id is distinct from actor),
+                         'meas', 'Measurements requested', a || ' · from ' || public._push_name(new.workspace_id, actor), u, 'meas:' || new.id);
+  end if;
+  -- A rep asked the office for a contract
+  if tg_op = 'UPDATE' and coalesce(new.data->'sale'->'er'->>'st','') = 'requested'
+     and coalesce(old.data->'sale'->'er'->>'st','') <> 'requested' then
+    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active and not support
+                                 and role in ('owner','manager','office') and user_id is distinct from actor),
+                         'jobs', 'Contract requested', a || ' · from ' || public._push_name(new.workspace_id, actor), u, 'contract:' || new.id);
+    return null;
+  end if;
+  -- The office sent the contract: tell the rep(s) on the job
+  if tg_op = 'UPDATE' and new.owner_id is not null and actor is distinct from new.owner_id
+     and coalesce(new.data->'sale'->'er'->>'st','') = 'ready'
+     and coalesce(new.data->'sale'->'er'->>'readyAt','') <> coalesce(old.data->'sale'->'er'->>'readyAt','') then
+    perform public._push(array_remove(array[new.owner_id,
+                           case when coalesce(new.data->'sale'->>'splitWith','') ~ '^[0-9a-f-]{36}$' then (new.data->'sale'->>'splitWith')::uuid end], null),
+      'jobs', 'Contract ready', a || ' · have the homeowner sign it', u, 'contract:' || new.id);
+    return null;
+  end if;
+  -- The homeowner signed: tell the owner, managers and office
+  if tg_op = 'UPDATE' and coalesce(new.data->'est'->>'sigAt','') <> '' and coalesce(old.data->'est'->>'sigAt','') = '' then
+    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active and not support
+                                 and role in ('owner','manager','office') and user_id is distinct from actor),
+      'jobs', 'Contract signed', a || coalesce(' · ' || nullif(new.data->'est'->>'sigName',''), ''), u, 'contract:' || new.id);
+    return null;
+  end if;
+  -- Insurance approved an amount: tell whoever didn't enter it
+  if tg_op = 'UPDATE' and coalesce(new.data->'ins'->>'rcv','') <> '' and coalesce(old.data->'ins'->>'rcv','') = '' then
+    perform public._push(array(select user_id from members where workspace_id = new.workspace_id and active and not support
+                                 and (role in ('owner','manager','office') or user_id = new.owner_id) and user_id is distinct from actor),
+      'jobs', 'Insurance approved', a || ' · $' || (new.data->'ins'->>'rcv'), u, 'ins:' || new.id);
+    return null;
+  end if;
+  -- The office approved, denied or delivered a measurement request: tell the rep(s) on the job
+  if tg_op = 'UPDATE' and new.owner_id is not null and actor is distinct from new.owner_id
+     and coalesce(new.data->'meas'->>'st','') in ('approved','denied','ready')
+     and coalesce(new.data->'meas'->>'st','') <> coalesce(old.data->'meas'->>'st','') then
+    who := case when actor is null then 'the office' else public._push_name(new.workspace_id, actor) end;
+    perform public._push(array_remove(array[new.owner_id,
+                           case when coalesce(new.data->'sale'->>'splitWith','') ~ '^[0-9a-f-]{36}$' then (new.data->'sale'->>'splitWith')::uuid end], null),
+      'jobs',
+      case new.data->'meas'->>'st' when 'approved' then 'Measurements approved'
+                                   when 'denied' then 'Measurement request denied'
+                                   else 'Measurements ready' end,
+      a || case new.data->'meas'->>'st' when 'approved' then ' · ' || who || ' is ordering them'
+                                        when 'denied' then coalesce(' · ' || nullif(new.data->'meas'->>'reason',''), ' · by ' || who)
+                                        else ' · tap to view the report' end,
+      u, 'meas:' || new.id);
+    return null;
   end if;
   if new.owner_id is null or not exists (select 1 from members where workspace_id = new.workspace_id and user_id = new.owner_id and active) then
     return null;
@@ -1000,7 +1074,7 @@ begin
   select count(*) into n from push_subs where user_id = auth.uid();
   if n = 0 then raise exception 'Turn on notifications on this device first'; end if;
   insert into push_outbox(user_id, kind, title, body, url, tag)
-  values (auth.uid(), 'test', 'Ridgeline notifications are on', 'This is what a notification looks like.', './#home', 'test');
+  values (auth.uid(), 'test', 'RUVA notifications are on', 'This is what a notification looks like.', './#home', 'test');
   return n;
 end $$;
 
@@ -1092,3 +1166,796 @@ begin
   end if;
   return paths;
 end $$;
+
+-- =====================================================================
+-- Billing (Stripe). 14-day free trial, then Solo $19/mo or Team $39 per person/mo.
+-- The "billing" Edge Function talks to Stripe; the app only reads these columns.
+-- Accounts that existed before billing launched are free (billing_exempt).
+-- =====================================================================
+alter table public.workspaces add column if not exists trial_ends_at      timestamptz not null default now() + interval '14 days';
+alter table public.workspaces add column if not exists sub_status         text not null default 'none';  -- none | trialing | active | past_due | unpaid | canceled | incomplete…
+alter table public.workspaces add column if not exists billing_exempt     boolean not null default false;
+alter table public.workspaces add column if not exists stripe_customer    text;
+alter table public.workspaces add column if not exists stripe_sub         text;
+alter table public.workspaces add column if not exists stripe_mode        text;                          -- test | live
+alter table public.workspaces add column if not exists seats              int;
+alter table public.workspaces add column if not exists period_end         timestamptz;
+alter table public.workspaces add column if not exists cancel_at_period_end boolean not null default false;
+-- Everything created before billing launched stays free.
+update public.workspaces set billing_exempt = true where created_at < '2026-11-06' and not billing_exempt;
+
+-- Is this account allowed to add and change things right now?
+create or replace function public.ws_active(ws uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select coalesce((select billing_exempt or sub_status in ('active','trialing','past_due') or trial_ends_at > now()
+                   from workspaces where id = ws), false)
+$$;
+
+-- Owners and managers edit settings, but billing fields only change through Stripe.
+create or replace function public.workspaces_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  if new.owner_id is distinct from old.owner_id or new.id is distinct from old.id then
+    raise exception 'The account owner cannot be changed here';
+  end if;
+  new.trial_ends_at := old.trial_ends_at; new.sub_status := old.sub_status; new.billing_exempt := old.billing_exempt;
+  new.stripe_customer := old.stripe_customer; new.stripe_sub := old.stripe_sub; new.stripe_mode := old.stripe_mode;
+  new.seats := old.seats; new.period_end := old.period_end; new.cancel_at_period_end := old.cancel_at_period_end;
+  return new;
+end $$;
+
+-- When the trial is over and nobody has paid, the account is read-only:
+-- people can still sign in, look at everything and export it, but not add or change things.
+create or replace function public.billing_write_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  if not public.ws_active(new.workspace_id) then
+    raise exception 'RIDGEMATE_INACTIVE: This RUVA account needs a plan. The owner can choose one in Settings → Plan & billing.';
+  end if;
+  return new;
+end $$;
+do $$ declare t text; begin
+  foreach t in array array['leads','messages','feed','knock_sessions','territories','skip_zones'] loop
+    execute format('drop trigger if exists billing_guard on public.%I', t);
+    execute format('create trigger billing_guard before insert or update on public.%I for each row execute function public.billing_write_guard()', t);
+  end loop;
+end $$;
+
+-- Stripe settings the function keeps for itself (prices, webhook secret, seat-sync token). Server only.
+create table if not exists public.billing_cfg (
+  mode        text primary key,           -- test | live
+  price_solo  text,
+  price_team  text,
+  webhook_id  text,
+  webhook_secret text,
+  fn_url      text not null default '',
+  wake_token  text not null default '',
+  updated_at  timestamptz not null default now()
+);
+alter table public.billing_cfg enable row level security;
+revoke all on public.billing_cfg from anon, authenticated;
+do $$ begin execute 'grant all on public.billing_cfg to service_role'; exception when others then null; end $$;
+
+-- Billing summary for the app (owner sees the Stripe bits; everyone sees whether it's active)
+create or replace function public.billing_info(ws uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare w workspaces; n int;
+begin
+  if not public.is_member(ws) then raise exception 'Not allowed'; end if;
+  select * into w from workspaces where id = ws;
+  select count(*) into n from members where workspace_id = ws and active and not support;
+  return jsonb_build_object('kind', w.kind, 'active', public.ws_active(ws), 'exempt', w.billing_exempt,
+    'status', w.sub_status, 'trial_ends_at', w.trial_ends_at, 'period_end', w.period_end,
+    'cancel_at_period_end', w.cancel_at_period_end, 'seats', coalesce(w.seats, 0), 'people', n,
+    'subscribed', w.stripe_sub is not null and w.sub_status not in ('canceled','incomplete_expired'),
+    'is_owner', w.owner_id = auth.uid());
+end $$;
+
+-- ---- for the billing Edge Function only (service role) -----------------
+create or replace function public.billing_cfg_get(p_mode text) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select to_jsonb(c) from billing_cfg c where mode = p_mode
+$$;
+create or replace function public.billing_cfg_set(p_mode text, p jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r billing_cfg;
+begin
+  insert into billing_cfg(mode) values (p_mode) on conflict (mode) do nothing;
+  update billing_cfg set
+    price_solo     = coalesce(p->>'price_solo', price_solo),
+    price_team     = coalesce(p->>'price_team', price_team),
+    webhook_id     = coalesce(p->>'webhook_id', webhook_id),
+    webhook_secret = coalesce(p->>'webhook_secret', webhook_secret),
+    fn_url         = coalesce(p->>'fn_url', fn_url),
+    wake_token     = coalesce(p->>'wake_token', wake_token),
+    updated_at     = now()
+  where mode = p_mode returning * into r;
+  return to_jsonb(r);
+end $$;
+-- Who is asking, and may they manage billing for this account?
+create or replace function public.billing_ws(ws uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare r jsonb; em text;
+begin
+  select to_jsonb(w) || jsonb_build_object('people', (select count(*) from members m where m.workspace_id = w.id and m.active and not m.support))
+    into r from workspaces w where w.id = ws;
+  if r is null then return null; end if;
+  begin execute 'select email from auth.users where id = $1' into em using (r->>'owner_id')::uuid; exception when others then em := null; end;
+  return r || jsonb_build_object('owner_email', em);
+end $$;
+create or replace function public.billing_set(ws uuid, p jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  update workspaces set
+    stripe_customer = case when p ? 'stripe_customer' then p->>'stripe_customer' else stripe_customer end,
+    stripe_sub      = case when p ? 'stripe_sub' then p->>'stripe_sub' else stripe_sub end,
+    stripe_mode     = case when p ? 'stripe_mode' then p->>'stripe_mode' else stripe_mode end,
+    sub_status      = coalesce(p->>'sub_status', sub_status),
+    seats           = case when p ? 'seats' then (p->>'seats')::int else seats end,
+    period_end      = case when p ? 'period_end' then (p->>'period_end')::timestamptz else period_end end,
+    cancel_at_period_end = coalesce((p->>'cancel_at_period_end')::boolean, cancel_at_period_end)
+  where id = ws;
+end $$;
+
+-- Team seat count follows the people in the company: wake the function when someone joins or leaves.
+create or replace function public._billing_wake() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare ws uuid := coalesce(new.workspace_id, old.workspace_id); w workspaces; c billing_cfg;
+begin
+  select * into w from workspaces where id = ws;
+  if w.id is null or w.stripe_sub is null or w.kind <> 'company' then return null; end if;
+  select * into c from billing_cfg where mode = coalesce(w.stripe_mode, 'test');
+  if c.fn_url is null or c.fn_url = '' then return null; end if;
+  begin
+    perform net.http_post(url := c.fn_url, body := jsonb_build_object('action','sync','ws',ws,'token',c.wake_token),
+                          headers := '{"Content-Type":"application/json"}'::jsonb);
+  exception when others then null;
+  end;
+  return null;
+end $$;
+drop trigger if exists billing_seats on public.members;
+create trigger billing_seats after insert or delete or update of active on public.members for each row execute function public._billing_wake();
+
+revoke execute on function public.billing_cfg_get(text) from public, anon, authenticated;
+revoke execute on function public.billing_cfg_set(text, jsonb) from public, anon, authenticated;
+revoke execute on function public.billing_ws(uuid) from public, anon, authenticated;
+revoke execute on function public.billing_set(uuid, jsonb) from public, anon, authenticated;
+revoke execute on function public._billing_wake() from public, anon, authenticated;
+do $$ begin
+  execute 'grant execute on function public.billing_cfg_get(text), public.billing_cfg_set(text, jsonb), public.billing_ws(uuid), public.billing_set(uuid, jsonb) to service_role';
+exception when others then null; end $$;
+
+-- =====================================================================
+-- Comp codes: give an account free use (forever, or for some months).
+-- You (platform admins) make codes in the app: Settings → Comp codes.
+-- An owner types the code in Settings → Plan & billing → Have a code?
+-- =====================================================================
+alter table public.workspaces add column if not exists comp_until timestamptz;
+alter table public.workspaces add column if not exists comp_code  text;
+
+create table if not exists public.platform_admins (user_id uuid primary key);
+create table if not exists public.comp_codes (
+  code       text primary key,
+  note       text not null default '',
+  months     int,                       -- null = free forever
+  max_uses   int not null default 1,
+  uses       int not null default 0,
+  expires_at timestamptz,
+  created_by uuid,
+  created_at timestamptz not null default now()
+);
+alter table public.platform_admins enable row level security;
+alter table public.comp_codes enable row level security;
+revoke all on public.platform_admins, public.comp_codes from anon, authenticated;
+
+-- You are the platform admin (matched by your sign-in email).
+do $$ begin
+  execute $q$insert into public.platform_admins(user_id)
+             select id from auth.users where lower(email) in ('support@ridgemate.app')
+             on conflict do nothing$q$;
+exception when others then null; end $$;
+
+-- Admin emails: whoever signs in with one of these is a RidgeMate admin (no need to exist first)
+create table if not exists public.platform_admin_emails (email text primary key);
+alter table public.platform_admin_emails enable row level security;
+revoke all on public.platform_admin_emails from anon, authenticated;
+insert into public.platform_admin_emails values ('support@ridgemate.app') on conflict do nothing;
+delete from public.platform_admin_emails where lower(email) <> 'support@ridgemate.app';
+create or replace function public.is_platform_admin() returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare e text;
+begin
+  if auth.uid() is null then return false; end if;
+  if exists(select 1 from platform_admins where user_id = auth.uid()) then return true; end if;
+  begin execute 'select lower(email) from auth.users where id = $1' into e using auth.uid(); exception when others then e := null; end;
+  return e is not null and exists(select 1 from platform_admin_emails where lower(email) = e);
+end $$;
+
+create or replace function public.ws_active(ws uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select coalesce((select billing_exempt or coalesce(comp_until > now(), false) or sub_status in ('active','trialing','past_due') or trial_ends_at > now()
+                   from workspaces where id = ws), false)
+$$;
+
+create or replace function public.workspaces_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  if new.owner_id is distinct from old.owner_id or new.id is distinct from old.id then
+    raise exception 'The account owner cannot be changed here';
+  end if;
+  new.trial_ends_at := old.trial_ends_at; new.sub_status := old.sub_status; new.billing_exempt := old.billing_exempt;
+  new.stripe_customer := old.stripe_customer; new.stripe_sub := old.stripe_sub; new.stripe_mode := old.stripe_mode;
+  new.seats := old.seats; new.period_end := old.period_end; new.cancel_at_period_end := old.cancel_at_period_end;
+  new.comp_until := old.comp_until; new.comp_code := old.comp_code;
+  return new;
+end $$;
+
+create or replace function public.billing_info(ws uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare w workspaces; n int;
+begin
+  if not public.is_member(ws) then raise exception 'Not allowed'; end if;
+  select * into w from workspaces where id = ws;
+  select count(*) into n from members where workspace_id = ws and active and not support;
+  return jsonb_build_object('kind', w.kind, 'active', public.ws_active(ws), 'exempt', w.billing_exempt,
+    'comp_until', case when w.comp_until > now() then w.comp_until end, 'comp_code', w.comp_code,
+    'status', w.sub_status, 'trial_ends_at', w.trial_ends_at, 'period_end', w.period_end,
+    'cancel_at_period_end', w.cancel_at_period_end, 'seats', coalesce(w.seats, 0), 'people', n,
+    'subscribed', w.stripe_sub is not null and w.sub_status not in ('canceled','incomplete_expired'),
+    'is_owner', w.owner_id = auth.uid(), 'platform_admin', public.is_platform_admin());
+end $$;
+
+-- Owner: redeem a code
+create or replace function public.redeem_comp_code(ws uuid, p_code text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare w workspaces; c comp_codes; k text := upper(regexp_replace(coalesce(p_code,''), '[^A-Za-z0-9]', '', 'g'));
+begin
+  select * into w from workspaces where id = ws;
+  if w.id is null or w.owner_id <> auth.uid() then raise exception 'Only the account owner can use a code'; end if;
+  if w.billing_exempt then raise exception 'This account is already free'; end if;
+  if w.stripe_sub is not null and w.sub_status in ('active','trialing','past_due') then
+    raise exception 'You have a paid plan — cancel it in Manage billing first, then enter the code';
+  end if;
+  select * into c from comp_codes where upper(regexp_replace(code, '[^A-Za-z0-9]', '', 'g')) = k for update;
+  if c.code is null or k = '' then raise exception 'That code isn''t valid'; end if;
+  if c.expires_at is not null and c.expires_at < now() then raise exception 'That code has expired'; end if;
+  if c.uses >= c.max_uses then raise exception 'That code has already been used'; end if;
+  update comp_codes set uses = uses + 1 where code = c.code;
+  if c.months is null then
+    update workspaces set billing_exempt = true, comp_code = c.code where id = ws;
+  else
+    update workspaces set comp_until = greatest(coalesce(comp_until, now()), now()) + make_interval(months => c.months), comp_code = c.code where id = ws;
+  end if;
+  return public.billing_info(ws);
+end $$;
+
+-- Platform admin: make, list and turn off codes
+create or replace function public.comp_code_create(p_code text, p_note text, p_months int, p_max_uses int, p_expires_days int default null) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k text := upper(regexp_replace(coalesce(p_code,''), '[^A-Za-z0-9-]', '', 'g')); r comp_codes;
+begin
+  if not public.is_platform_admin() then raise exception 'Not allowed'; end if;
+  if k = '' then k := 'RM-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 6)); end if;
+  if length(k) < 4 then raise exception 'Make the code at least 4 letters or numbers'; end if;
+  insert into comp_codes(code, note, months, max_uses, expires_at, created_by)
+  values (k, coalesce(p_note,''), case when p_months > 0 then p_months end, greatest(1, coalesce(p_max_uses,1)),
+          case when p_expires_days > 0 then now() + make_interval(days => p_expires_days) end, auth.uid())
+  returning * into r;
+  return to_jsonb(r);
+exception when unique_violation then raise exception 'That code already exists — pick another';
+end $$;
+create or replace function public.comp_codes_list() returns setof public.comp_codes
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_platform_admin() then raise exception 'Not allowed'; end if;
+  return query select * from comp_codes order by created_at desc limit 200;
+end $$;
+create or replace function public.comp_code_disable(p_code text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_platform_admin() then raise exception 'Not allowed'; end if;
+  update comp_codes set max_uses = uses where code = p_code;
+end $$;
+
+-- =====================================================================
+-- RUVA support console (admin.ridgemate.app)
+-- Platform admins can look up accounts and fix things. They never see private messages.
+-- Homeowner details are visible only while the owner has turned on support access.
+-- Everything an admin does is written to admin_log, which the account's owner can read.
+-- =====================================================================
+alter table public.support_grants enable row level security;
+revoke all on public.support_grants from anon, authenticated;
+
+create table if not exists public.admin_log (
+  id           bigserial primary key,
+  workspace_id uuid,
+  actor        uuid,
+  by_support   boolean not null default true,
+  action       text not null,
+  created_at   timestamptz not null default now()
+);
+create index if not exists admin_log_ws_idx on public.admin_log(workspace_id, created_at desc);
+alter table public.admin_log enable row level security;
+revoke all on public.admin_log from anon, authenticated;
+
+-- Deleted leads are kept 30 days so support can bring one back
+create table if not exists public.leads_trash (
+  id           bigserial primary key,
+  workspace_id uuid not null,
+  lead         jsonb not null,
+  deleted_by   uuid,
+  deleted_at   timestamptz not null default now()
+);
+create index if not exists leads_trash_ws_idx on public.leads_trash(workspace_id, deleted_at desc);
+alter table public.leads_trash enable row level security;
+revoke all on public.leads_trash from anon, authenticated;
+create or replace function public._lead_to_trash() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  -- only leads deleted one at a time; deleting a whole company or account (a cascade) keeps nothing
+  if pg_trigger_depth() <= 1 and auth.uid() is not null then
+    insert into leads_trash(workspace_id, lead, deleted_by) values (old.workspace_id, to_jsonb(old), auth.uid());
+  end if;
+  return old;
+end $$;
+drop trigger if exists lead_to_trash on public.leads;
+create trigger lead_to_trash before delete on public.leads for each row execute function public._lead_to_trash();
+do $$ begin
+  begin perform cron.unschedule('ridgemate-trash-purge'); exception when others then null; end;
+  begin perform cron.schedule('ridgemate-trash-purge', '30 7 * * *', $c$delete from public.leads_trash where deleted_at < now() - interval '30 days'; delete from public.admin_log where created_at < now() - interval '2 years'$c$);
+  exception when others then null; end;
+end $$;
+
+create or replace function public._alog(ws uuid, p_action text, p_support boolean default true) returns void
+language sql security definer set search_path = public as $$
+  insert into admin_log(workspace_id, actor, by_support, action) values (ws, auth.uid(), p_support, left(p_action, 400))
+$$;
+create or replace function public._need_admin() returns void
+language plpgsql stable security definer set search_path = public as $$
+begin if not public.is_platform_admin() then raise exception 'Not allowed'; end if; end $$;
+create or replace function public._email_of(u uuid) returns text
+language plpgsql stable security definer set search_path = public as $$
+declare e text;
+begin
+  begin execute 'select email from auth.users where id = $1' into e using u; exception when others then e := null; end;
+  return e;
+end $$;
+create or replace function public._grant_live(ws uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists(select 1 from support_grants where workspace_id = ws and expires_at > now())
+$$;
+
+-- ---- for owners, in the app ----------------------------------------------
+create or replace function public.support_grant(ws uuid, p_hours int) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare h int := greatest(1, least(coalesce(p_hours, 24), 24 * 14));
+begin
+  if public.my_role(ws) is distinct from 'owner' then raise exception 'Only the account owner can allow support access'; end if;
+  insert into support_grants(workspace_id, granted_by, expires_at) values (ws, auth.uid(), now() + make_interval(hours => h))
+  on conflict (workspace_id) do update set granted_by = excluded.granted_by, expires_at = excluded.expires_at, created_at = now();
+  perform public._alog(ws, 'Support access turned on for ' || case when h % 24 = 0 then (h/24) || ' day' || case when h/24 > 1 then 's' else '' end else h || ' hours' end, false);
+  return public.support_info(ws);
+end $$;
+create or replace function public.support_revoke(ws uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+begin
+  if public.my_role(ws) is distinct from 'owner' then raise exception 'Only the account owner can change support access'; end if;
+  delete from support_grants where workspace_id = ws;
+  delete from members where workspace_id = ws and support;
+  perform public._alog(ws, 'Support access turned off', false);
+  return public.support_info(ws);
+end $$;
+create or replace function public.support_info(ws uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager(ws) then raise exception 'Only owners and managers can see this'; end if;
+  return jsonb_build_object(
+    'expires_at', (select expires_at from support_grants where workspace_id = ws and expires_at > now()),
+    'log', coalesce((select jsonb_agg(jsonb_build_object('at', a.created_at, 'action', a.action, 'support', a.by_support,
+              'by', case when a.by_support then 'RUVA support' else coalesce((select nullif(display_name,'') from members where workspace_id = ws and user_id = a.actor), 'Owner') end)
+              order by a.created_at desc)
+            from (select * from admin_log where workspace_id = ws order by created_at desc limit 100) a), '[]'::jsonb));
+end $$;
+
+-- ---- for platform admins (support console) -------------------------------
+create or replace function public.admin_whoami() returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+begin
+  return jsonb_build_object('admin', public.is_platform_admin(), 'email', public._email_of(auth.uid()));
+end $$;
+
+create or replace function public.admin_search(p_q text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare q text := '%' || lower(trim(coalesce(p_q,''))) || '%'; r jsonb;
+begin
+  perform public._need_admin();
+  with hits as (
+    select w.id from workspaces w where lower(w.name) like q
+    union
+    select m.workspace_id from members m where not m.support and (lower(m.display_name) like q or lower(coalesce(public._email_of(m.user_id),'')) like q)
+  )
+  select coalesce(jsonb_agg(x order by x->>'created_at' desc), '[]'::jsonb) into r from (
+    select jsonb_build_object('id', w.id, 'name', w.name, 'kind', w.kind, 'created_at', w.created_at,
+      'owner', (select nullif(display_name,'') from members where workspace_id = w.id and user_id = w.owner_id),
+      'owner_email', public._email_of(w.owner_id),
+      'people', (select count(*) from members where workspace_id = w.id and active and not support),
+      'active', public.ws_active(w.id), 'exempt', w.billing_exempt, 'comp_until', w.comp_until,
+      'status', w.sub_status, 'trial_ends_at', w.trial_ends_at, 'grant', public._grant_live(w.id)) x
+    from workspaces w where w.id in (select id from hits) limit 60) t;
+  return r;
+end $$;
+
+create or replace function public.admin_account(ws uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare w workspaces; r jsonb;
+begin
+  perform public._need_admin();
+  select * into w from workspaces where id = ws;
+  if w.id is null then raise exception 'Account not found'; end if;
+  r := jsonb_build_object(
+    'id', w.id, 'name', w.name, 'kind', w.kind, 'created_at', w.created_at, 'owner_id', w.owner_id, 'owner_email', public._email_of(w.owner_id),
+    'active', public.ws_active(ws), 'exempt', w.billing_exempt, 'comp_until', w.comp_until, 'comp_code', w.comp_code,
+    'status', w.sub_status, 'trial_ends_at', w.trial_ends_at, 'period_end', w.period_end, 'cancel_at_period_end', w.cancel_at_period_end,
+    'seats', w.seats, 'stripe_customer', w.stripe_customer, 'stripe_mode', w.stripe_mode,
+    'grant_until', (select expires_at from support_grants where workspace_id = ws and expires_at > now()),
+    'members', coalesce((select jsonb_agg(jsonb_build_object('user_id', m.user_id, 'name', m.display_name, 'role', m.role, 'active', m.active,
+                  'email', public._email_of(m.user_id), 'joined_at', m.joined_at, 'support', m.support,
+                  'leads', (select count(*) from leads l where l.workspace_id = ws and l.owner_id = m.user_id)) order by m.support, m.joined_at)
+                from members m where m.workspace_id = ws), '[]'::jsonb),
+    'counts', jsonb_build_object(
+      'leads', (select count(*) from leads where workspace_id = ws),
+      'board', (select count(*) from leads where workspace_id = ws and pool),
+      'sold', (select count(*) from leads where workspace_id = ws and status = 'Sold'),
+      'photos', (select coalesce(sum(case when jsonb_typeof(data->'photos') = 'array' then jsonb_array_length(data->'photos') else 0 end),0) from leads where workspace_id = ws),
+      'messages', (select count(*) from messages where workspace_id = ws),
+      'trash', (select count(*) from leads_trash where workspace_id = ws and deleted_at > now() - interval '30 days')),
+    'log', coalesce((select jsonb_agg(jsonb_build_object('at', a.created_at, 'action', a.action, 'support', a.by_support,
+              'by', case when a.by_support then coalesce(public._email_of(a.actor), 'Support') else 'Owner' end) order by a.created_at desc)
+            from (select * from admin_log where workspace_id = ws order by created_at desc limit 60) a), '[]'::jsonb));
+  return r;
+end $$;
+
+create or replace function public.admin_extend_trial(ws uuid, p_days int) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  if coalesce(p_days,0) < 1 or p_days > 365 then raise exception 'Pick 1 to 365 days'; end if;
+  update workspaces set trial_ends_at = greatest(trial_ends_at, now()) + make_interval(days => p_days) where id = ws;
+  perform public._alog(ws, 'Free trial extended ' || p_days || ' day' || case when p_days > 1 then 's' else '' end);
+end $$;
+
+create or replace function public.admin_comp(ws uuid, p_months int) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  if coalesce(p_months,0) <= 0 then
+    update workspaces set billing_exempt = true, comp_code = 'SUPPORT' where id = ws;
+    perform public._alog(ws, 'Account made free (comped) by support');
+  else
+    update workspaces set comp_until = greatest(coalesce(comp_until, now()), now()) + make_interval(months => p_months), comp_code = 'SUPPORT' where id = ws;
+    perform public._alog(ws, 'Comped ' || p_months || ' month' || case when p_months > 1 then 's' else '' end || ' by support');
+  end if;
+end $$;
+create or replace function public.admin_uncomp(ws uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  update workspaces set billing_exempt = false, comp_until = null, comp_code = null where id = ws;
+  perform public._alog(ws, 'Comp removed — back to normal billing');
+end $$;
+
+create or replace function public.admin_set_member(ws uuid, p_user uuid, p_role text, p_active boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare m members; nm text;
+begin
+  perform public._need_admin();
+  select * into m from members where workspace_id = ws and user_id = p_user;
+  if m.user_id is null then raise exception 'Person not found'; end if;
+  if m.role = 'owner' then raise exception 'Use Transfer ownership to change the owner'; end if;
+  if p_role is not null and p_role not in ('manager','rep','office') then raise exception 'Unknown role'; end if;
+  nm := coalesce(nullif(m.display_name,''), 'a teammate');
+  update members set role = coalesce(p_role, role), active = coalesce(p_active, active) where workspace_id = ws and user_id = p_user;
+  if p_role is not null and p_role <> m.role then perform public._alog(ws, nm || ' changed from ' || m.role || ' to ' || p_role); end if;
+  if p_active is not null and p_active <> m.active then perform public._alog(ws, nm || case when p_active then ' reactivated' else ' deactivated' end); end if;
+end $$;
+
+create or replace function public.admin_remove_member(ws uuid, p_user uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare m members; w workspaces; r jsonb;
+begin
+  perform public._need_admin();
+  select * into m from members where workspace_id = ws and user_id = p_user;
+  select * into w from workspaces where id = ws;
+  if m.user_id is null then raise exception 'Person not found'; end if;
+  if m.role = 'owner' then raise exception 'Transfer ownership first'; end if;
+  r := public._remove_member(ws, p_user, w.owner_id);
+  perform public._alog(ws, coalesce(nullif(m.display_name,''),'A teammate') || ' removed — ' || (r->>'board') || ' open lead(s) to the board');
+  return r;
+end $$;
+
+create or replace function public.admin_transfer_owner(ws uuid, p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare w workspaces; m members;
+begin
+  perform public._need_admin();
+  select * into w from workspaces where id = ws;
+  select * into m from members where workspace_id = ws and user_id = p_user and active and not support;
+  if m.user_id is null then raise exception 'That person isn''t an active member of this account'; end if;
+  if p_user = w.owner_id then return; end if;
+  update members set role = 'manager' where workspace_id = ws and user_id = w.owner_id;
+  update members set role = 'owner' where workspace_id = ws and user_id = p_user;
+  update workspaces set owner_id = p_user where id = ws;
+  perform public._alog(ws, 'Ownership transferred to ' || coalesce(nullif(m.display_name,''), public._email_of(p_user), 'a member') || ' (previous owner is now a manager)');
+end $$;
+
+create or replace function public.admin_invite(ws uuid, p_role text) returns text
+language plpgsql security definer set search_path = public as $$
+declare c text; w workspaces;
+begin
+  perform public._need_admin();
+  if p_role not in ('manager','rep','office') then raise exception 'Unknown role'; end if;
+  select * into w from workspaces where id = ws;
+  c := upper(substr(replace(gen_random_uuid()::text,'-',''),1,6));
+  insert into invites(code, workspace_id, role, created_by) values (c, ws, p_role, w.owner_id);
+  perform public._alog(ws, 'Support made a ' || p_role || ' invite code');
+  return c;
+end $$;
+
+create or replace function public.admin_change_email(p_user uuid, p_email text) returns void
+language plpgsql security definer set search_path = public as $$
+declare e text := lower(trim(coalesce(p_email,''))); old text := public._email_of(p_user); n int; ws uuid;
+begin
+  perform public._need_admin();
+  if e !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'That doesn''t look like an email address'; end if;
+  begin
+    execute 'select count(*) from auth.users where lower(email) = $1 and id <> $2' into n using e, p_user;
+    if n > 0 then raise exception 'EMAIL_TAKEN'; end if;
+    execute 'update auth.users set email = $1, email_change = '''', email_change_token_new = '''', email_change_token_current = '''', updated_at = now() where id = $2' using e, p_user;
+    begin
+      execute 'update auth.identities set identity_data = identity_data || jsonb_build_object(''email'', $1::text), updated_at = now() where user_id = $2 and provider = ''email''' using e, p_user;
+    exception when others then null; end;
+  exception
+    when raise_exception then
+      if sqlerrm = 'EMAIL_TAKEN' then raise exception 'Another RUVA login already uses %', e; end if; raise;
+    when others then
+      raise exception 'Couldn''t change it from here (%). Change it in Supabase → Authentication → Users instead.', sqlerrm;
+  end;
+  for ws in select workspace_id from members where user_id = p_user and not support loop
+    perform public._alog(ws, 'Sign-in email changed from ' || coalesce(old,'?') || ' to ' || e);
+  end loop;
+end $$;
+
+create or replace function public.admin_move_leads(ws uuid, p_from uuid, p_to uuid) returns int
+language plpgsql security definer set search_path = public as $$
+declare n int; w workspaces; nm text; ms bigint := (extract(epoch from now())*1000)::bigint;
+begin
+  perform public._need_admin();
+  select * into w from workspaces where id = ws;
+  nm := coalesce((select nullif(display_name,'') from members where workspace_id = ws and user_id = p_from), 'a teammate');
+  if p_to is null then
+    update leads set owner_id = null, pool = true, origin = 'company', posted_by = w.owner_id, posted_at = now(),
+           claimed_at = null, contacted_at = null, protected_until = null, updated_at = now(),
+           data = jsonb_set(data, '{post}', jsonb_build_object('job','Follow up','insurance', coalesce(data->'sale'->>'type','') = 'Insurance','window','',
+                    'source','Was ' || nm || '''s','public_notes','Last status: ' || status))
+     where workspace_id = ws and owner_id = p_from and status not in ('Sold','Cancelled','Finance Denied');
+    get diagnostics n = row_count;
+    perform public._alog(ws, n || ' open lead(s) from ' || nm || ' moved to the Open Leads board');
+  else
+    if not exists(select 1 from members where workspace_id = ws and user_id = p_to and active and not support) then raise exception 'Pick an active member'; end if;
+    update leads set owner_id = p_to, updated_at = now(),
+           data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) || jsonb_build_array(
+                  jsonb_build_object('t', ms, 'r', 'Reassigned', 'by', w.owner_id, 'from', p_from, 'note', 'Moved by support')))
+     where workspace_id = ws and owner_id = p_from and status not in ('Sold','Cancelled','Finance Denied');
+    get diagnostics n = row_count;
+    perform public._alog(ws, n || ' open lead(s) moved from ' || nm || ' to ' || coalesce((select nullif(display_name,'') from members where workspace_id = ws and user_id = p_to), 'a teammate'));
+  end if;
+  return n;
+end $$;
+
+-- Trash shows only the street address (to identify the lead), not homeowner names or phones
+create or replace function public.admin_trash(ws uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  return coalesce((select jsonb_agg(jsonb_build_object('id', t.id, 'deleted_at', t.deleted_at,
+      'address', nullif(trim(coalesce(t.lead->>'num','') || ' ' || coalesce(t.lead->>'street','') || case when coalesce(t.lead->>'city','') <> '' then ', ' || (t.lead->>'city') else '' end), ''),
+      'status', t.lead->>'status',
+      'by', coalesce((select nullif(display_name,'') from members where workspace_id = ws and user_id = t.deleted_by), 'someone')) order by t.deleted_at desc)
+    from leads_trash t where t.workspace_id = ws and t.deleted_at > now() - interval '30 days'), '[]'::jsonb);
+end $$;
+create or replace function public.admin_restore_lead(p_id bigint) returns void
+language plpgsql security definer set search_path = public as $$
+declare t leads_trash; l leads;
+begin
+  perform public._need_admin();
+  select * into t from leads_trash where id = p_id;
+  if t.id is null then raise exception 'Not found'; end if;
+  l := jsonb_populate_record(null::leads, t.lead);
+  if exists(select 1 from leads where id = l.id) then raise exception 'That lead is already back'; end if;
+  if l.owner_id is not null and not exists(select 1 from members where workspace_id = l.workspace_id and user_id = l.owner_id and active) then
+    l.owner_id := null; l.pool := true;
+  end if;
+  l.updated_at := now();
+  insert into leads select l.*;
+  delete from leads_trash where id = p_id;
+  perform public._alog(t.workspace_id, 'Deleted lead restored: ' || coalesce(nullif(trim(coalesce(l.num,'') || ' ' || coalesce(l.street,'')),''), 'a lead'));
+end $$;
+
+-- Open the account in the app as "RidgeMate Support" (only while the owner allows it)
+create or replace function public.admin_open(ws uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare g support_grants;
+begin
+  perform public._need_admin();
+  select * into g from support_grants where workspace_id = ws and expires_at > now();
+  if g.workspace_id is null then raise exception 'The owner hasn''t turned on support access. Ask them: Settings → Support access → Allow.'; end if;
+  if exists(select 1 from members where workspace_id = ws and user_id = auth.uid() and not support) then return; end if;
+  insert into members(workspace_id, user_id, role, display_name, support, active)
+  values (ws, auth.uid(), 'manager', 'RUVA Support', true, true)
+  on conflict (workspace_id, user_id) do update set role = 'manager', active = true, support = true, display_name = 'RUVA Support';
+  perform public._alog(ws, 'Support opened the account in the app (access until ' || to_char(g.expires_at at time zone 'America/New_York', 'Mon DD, HH12:MI AM') || ')');
+end $$;
+create or replace function public.admin_close(ws uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  delete from members where workspace_id = ws and user_id = auth.uid() and support;
+  perform public._alog(ws, 'Support closed the account');
+end $$;
+
+create or replace function public.admin_recent() returns jsonb
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  return jsonb_build_object(
+    'accounts', (select count(*) from workspaces),
+    'paying', (select count(*) from workspaces where sub_status in ('active','past_due') and stripe_mode = 'live'),
+    'trialing', (select count(*) from workspaces where not billing_exempt and trial_ends_at > now() and stripe_sub is null),
+    'grants', coalesce((select jsonb_agg(jsonb_build_object('id', w.id, 'name', w.name, 'until', g.expires_at)) from support_grants g join workspaces w on w.id = g.workspace_id where g.expires_at > now()), '[]'::jsonb));
+end $$;
+
+revoke execute on function public._alog(uuid, text, boolean) from public, anon, authenticated;
+revoke execute on function public._email_of(uuid) from public, anon, authenticated;
+revoke execute on function public._need_admin() from public, anon, authenticated;
+revoke execute on function public._lead_to_trash() from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------
+-- Job profit & commission (owners and managers only)
+-- The owner enters materials and labor on a sold job; profit = contract − costs
+-- (or his own number). Each rep on the job gets a share of profit (10–50%,
+-- 50% combined at most). Reps never see the cost breakdown: they read their
+-- own line through my_comms(), which returns contract, total job cost,
+-- profit, their share and amount.
+-- ---------------------------------------------------------------------
+create table if not exists public.job_comm (
+  lead_id      text primary key references public.leads(id) on delete cascade,
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  materials    numeric not null default 0,
+  labor        numeric not null default 0,
+  profit       numeric,                         -- null = contract − materials − labor
+  contract     numeric not null default 0,      -- snapshot at approval
+  shares       jsonb not null default '[]'::jsonb, -- [{user_id, pct, amount}]
+  status       text not null default 'approved' check (status in ('approved','paid')),
+  approved_by  uuid,
+  approved_at  timestamptz,
+  paid_at      timestamptz,
+  updated_at   timestamptz not null default now()
+);
+create index if not exists job_comm_ws_idx on public.job_comm(workspace_id);
+alter table public.job_comm enable row level security;
+drop policy if exists job_comm_mgr on public.job_comm;
+create policy job_comm_mgr on public.job_comm for select using (public.is_manager(workspace_id));
+revoke insert, update, delete on public.job_comm from anon, authenticated;
+
+create or replace function public._money(t text) returns numeric
+language sql immutable as $$ select coalesce(nullif(regexp_replace(coalesce(t,''),'[^0-9.]','','g'),'')::numeric, 0) $$;
+
+create or replace function public.comm_approve(p_lead text, p_materials numeric, p_labor numeric, p_profit numeric, p_shares jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare l leads; ct numeric; pr numeric; tot numeric := 0; s jsonb; out jsonb := '[]'::jsonb; who uuid[] := '{}'; amt numeric; pc numeric;
+begin
+  select * into l from leads where id = p_lead;
+  if l.id is null then raise exception 'Lead not found'; end if;
+  if not public.is_manager(l.workspace_id) then raise exception 'Only the owner or a manager can approve commission'; end if;
+  if not public.ws_active(l.workspace_id) then raise exception 'RIDGEMATE_INACTIVE: This RUVA account needs a plan.'; end if;
+  if jsonb_typeof(p_shares) <> 'array' or jsonb_array_length(p_shares) = 0 or jsonb_array_length(p_shares) > 2 then
+    raise exception 'Pick one or two reps'; end if;
+  ct := public._money(l.data->'sale'->>'value') + public._money(l.data->'sale'->>'upgrades') + public._money(l.data->'sale'->>'supplements');
+  pr := coalesce(p_profit, ct - coalesce(p_materials,0) - coalesce(p_labor,0));
+  for s in select * from jsonb_array_elements(p_shares) loop
+    pc := (s->>'pct')::numeric;
+    if pc not in (10,20,25,30,50) then raise exception 'Rep share must be 10, 20, 25, 30 or 50%%'; end if;
+    if not exists (select 1 from members where workspace_id = l.workspace_id and user_id = (s->>'user_id')::uuid and active and not coalesce(support,false)) then
+      raise exception 'That rep isn''t on this team'; end if;
+    if (s->>'user_id')::uuid = any(who) then raise exception 'Pick two different reps'; end if;
+    tot := tot + pc; who := who || (s->>'user_id')::uuid;
+    amt := round(greatest(pr,0) * pc / 100, 2);
+    out := out || jsonb_build_object('user_id', s->>'user_id', 'pct', pc, 'amount', amt);
+  end loop;
+  if tot > 50 then raise exception 'Shares can''t add up to more than 50%%'; end if;
+  insert into job_comm(lead_id, workspace_id, materials, labor, profit, contract, shares, status, approved_by, approved_at, paid_at, updated_at)
+  values (l.id, l.workspace_id, coalesce(p_materials,0), coalesce(p_labor,0), p_profit, ct, out, 'approved', auth.uid(), now(), null, now())
+  on conflict (lead_id) do update set materials = excluded.materials, labor = excluded.labor, profit = excluded.profit,
+    contract = excluded.contract, shares = excluded.shares, status = 'approved', approved_by = excluded.approved_by,
+    approved_at = excluded.approved_at, paid_at = null, updated_at = now();
+  for s in select * from jsonb_array_elements(out) loop
+    perform public._push(array[(s->>'user_id')::uuid], 'comm', 'Commission approved',
+      '$' || to_char((s->>'amount')::numeric, 'FM999,999,990') || ' on ' || trim(l.num || ' ' || l.street), './#money', 'comm:' || l.id);
+  end loop;
+  return out;
+end $$;
+
+create or replace function public.comm_paid(p_lead text, p_paid boolean default true) returns void
+language plpgsql security definer set search_path = public as $$
+declare c job_comm; s jsonb; l leads;
+begin
+  select * into c from job_comm where lead_id = p_lead;
+  if c.lead_id is null then raise exception 'Approve the commission first'; end if;
+  if not public.is_manager(c.workspace_id) then raise exception 'Only the owner or a manager can mark commission paid'; end if;
+  update job_comm set status = case when p_paid then 'paid' else 'approved' end, paid_at = case when p_paid then now() end, updated_at = now() where lead_id = p_lead;
+  if p_paid then
+    select * into l from leads where id = p_lead;
+    for s in select * from jsonb_array_elements(c.shares) loop
+      perform public._push(array[(s->>'user_id')::uuid], 'comm', 'Commission paid',
+        '$' || to_char((s->>'amount')::numeric, 'FM999,999,990') || ' on ' || trim(coalesce(l.num,'') || ' ' || coalesce(l.street,'')), './#money', 'comm:' || p_lead);
+    end loop;
+  end if;
+end $$;
+
+create or replace function public.comm_clear(p_lead text) returns void
+language plpgsql security definer set search_path = public as $$
+declare w uuid;
+begin
+  select workspace_id into w from job_comm where lead_id = p_lead;
+  if w is null then return; end if;
+  if not public.is_manager(w) then raise exception 'Not allowed'; end if;
+  delete from job_comm where lead_id = p_lead;
+end $$;
+
+-- A rep's own commission lines: totals only, never the cost breakdown.
+create or replace function public.my_comms(ws uuid) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'lead_id', c.lead_id, 'status', c.status, 'contract', c.contract,
+      'job_cost', c.materials + c.labor,
+      'profit', coalesce(c.profit, c.contract - c.materials - c.labor),
+      'pct', (s->>'pct')::numeric, 'amount', (s->>'amount')::numeric,
+      'split', jsonb_array_length(c.shares) > 1,
+      'approved_by', public._push_name(c.workspace_id, c.approved_by),
+      'approved_at', c.approved_at, 'paid_at', c.paid_at,
+      'num', l.num, 'street', l.street, 'name', l.name) order by c.approved_at desc), '[]'::jsonb)
+  from job_comm c join leads l on l.id = c.lead_id
+  cross join lateral jsonb_array_elements(c.shares) s
+  where c.workspace_id = ws and public.is_member(ws) and (s->>'user_id')::uuid = auth.uid()
+$$;
+grant execute on function public.comm_approve(text, numeric, numeric, numeric, jsonb), public.comm_paid(text, boolean), public.comm_clear(text), public.my_comms(uuid) to authenticated;
+grant select on public.job_comm to authenticated;
+
+
+-- =====================================================================
+-- Share links: a photo page for the homeowner or adjuster, no login needed
+create table if not exists public.shares (
+  token        text primary key check (length(token) >= 20),
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id      text not null,
+  created_by   uuid not null default auth.uid(),
+  payload      jsonb not null,
+  created_at   timestamptz not null default now(),
+  expires_at   timestamptz not null default now() + interval '60 days'
+);
+alter table public.shares enable row level security;
+drop policy if exists shares_rw on public.shares;
+create policy shares_rw on public.shares for all to authenticated
+  using (public.is_member(workspace_id) and public.can_see_lead(lead_id))
+  with check (public.is_member(workspace_id) and public.can_see_lead(lead_id));
+grant select, insert, update, delete on public.shares to authenticated;
+revoke all on public.shares from anon;
+create or replace function public.get_share(p_token text) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select payload from shares where token = p_token and length(p_token) >= 20 and expires_at > now()
+$$;
+revoke execute on function public.get_share(text) from public;
+grant execute on function public.get_share(text) to anon, authenticated;
