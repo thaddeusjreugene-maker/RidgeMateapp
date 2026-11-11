@@ -1959,3 +1959,24 @@ language sql stable security definer set search_path = public as $$
 $$;
 revoke execute on function public.get_share(text) from public;
 grant execute on function public.get_share(text) to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Office data kept safe from older phone apps.
+-- The office dashboard stores tasks, emails, documents, job numbers, closed jobs,
+-- locations and automatic-task history inside leads.data. A phone still running
+-- an older app version doesn't know those keys and would save the lead without
+-- them. This puts them back whenever an update leaves one out.
+-- ---------------------------------------------------------------------------
+create or replace function public._keep_office_keys() returns trigger
+language plpgsql as $$
+declare k text;
+begin
+  foreach k in array array['tasks','emails','gdocs','jobNo','closed','branch','fired'] loop
+    if (old.data ? k) and not (new.data ? k) then
+      new.data := new.data || jsonb_build_object(k, old.data -> k);
+    end if;
+  end loop;
+  return new;
+end $$;
+drop trigger if exists keep_office_keys on public.leads;
+create trigger keep_office_keys before update on public.leads for each row execute function public._keep_office_keys();
