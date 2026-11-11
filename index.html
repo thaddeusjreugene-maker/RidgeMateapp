@@ -2836,6 +2836,7 @@ Suggested solution: ${e.workaround}`),new Error(t)}static isWebSocketSupported()
     <div class="grid2" style="grid-template-columns:110px 1fr">
       <label class="field"><span>House #</span><input type="text" inputmode="numeric" id="k-num" value="${esc(pre.num||"")}" autocomplete="off"></label>
       <label class="field"><span>Street</span><input type="text" id="k-street" list="k-streets" value="${esc(pre.street??S2.lastStreet)}" autocomplete="off"></label></div>
+    ${pre.geo&&pre.num?'<p class="mc-warn" style="margin:-4px 0 0">The map guessed this address from your pin. Check the house number on the mailbox. The map can be one or two houses off.</p>':""}
     <datalist id="k-streets">${streetsData().map(s=>`<option value="${esc(s.name)}">`).join("")}</datalist>
     <label class="field"><span>Name (optional)</span><input type="text" id="k-name" autocomplete="off"></label>
     <div><div class="label" style="margin-bottom:8px">What happened?</div><div class="chips" id="k-res">${KNOCK_RESULTS.map(k=>`<button class="chip" style="--c:${sv(k)}" data-r="${esc(k)}" aria-pressed="false"><span class="sw"></span>${esc(k)}</button>`).join("")}</div></div>
