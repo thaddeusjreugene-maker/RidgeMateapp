@@ -1362,7 +1362,7 @@ create table if not exists public.platform_admin_emails (email text primary key)
 alter table public.platform_admin_emails enable row level security;
 revoke all on public.platform_admin_emails from anon, authenticated;
 insert into public.platform_admin_emails values ('support@ridgemate.app') on conflict do nothing;
-delete from public.platform_admin_emails where lower(email) <> 'support@ridgemate.app';
+delete from public.platform_admin_emails where lower(email) not in ('support@ridgemate.app','support@useruva.com','thadjacobs@useruva.com');
 create or replace function public.is_platform_admin() returns boolean
 language plpgsql stable security definer set search_path = public as $$
 declare e text;
@@ -1980,3 +1980,258 @@ begin
 end $$;
 drop trigger if exists keep_office_keys on public.leads;
 create trigger keep_office_keys before update on public.leads for each row execute function public._keep_office_keys();
+-- RUVA: customer feedback form on useruva.com/feedback. Safe to run more than once.
+create table if not exists public.feedback (
+  id bigint generated always as identity primary key,
+  created_at timestamptz not null default now(),
+  name text, company text, answers jsonb not null default '{}'::jsonb
+);
+alter table public.feedback enable row level security;
+revoke all on public.feedback from anon, authenticated;
+
+create or replace function public.submit_feedback(p jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if p is null or jsonb_typeof(p) <> 'object' or pg_column_size(p) > 20000 then raise exception 'Bad form'; end if;
+  insert into feedback(name, company, answers)
+  values (left(p->>'name', 80), left(p->>'company', 120), p - 'name' - 'company');
+end $$;
+revoke all on function public.submit_feedback(jsonb) from public;
+grant execute on function public.submit_feedback(jsonb) to anon, authenticated;
+-- RUVA: private link to read feedback answers, plus a phone notification when someone answers.
+create table if not exists public.feedback_key (id int primary key default 1 check (id = 1), k text not null);
+alter table public.feedback_key enable row level security;
+revoke all on public.feedback_key from anon, authenticated;
+
+create or replace function public.list_feedback(p_k text) returns setof public.feedback
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if p_k is null or not exists (select 1 from feedback_key where k = p_k) then raise exception 'Not allowed'; end if;
+  return query select * from feedback order by created_at desc limit 500;
+end $$;
+revoke all on function public.list_feedback(text) from public;
+grant execute on function public.list_feedback(text) to anon, authenticated;
+
+create or replace function public._feedback_notify() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._push(array(select id from auth.users where lower(email) = 'thaddeusjreugene@icloud.com'), 'feedback',
+    'New feedback' || coalesce(' from ' || nullif(new.name, ''), ''), coalesce(nullif(new.company, ''), 'Someone answered your questions'),
+    'https://useruva.com/feedback/answers.html', 'feedback');
+  return new;
+exception when others then return new;
+end $$;
+drop trigger if exists feedback_notify on public.feedback;
+create trigger feedback_notify after insert on public.feedback for each row execute function public._feedback_notify();
+
+-- RUVA HQ: the company's own back office (prospects, founding-spot requests, feedback, launch checklist).
+-- Safe to run more than once.
+
+-- Who can sign in to RUVA HQ
+insert into public.platform_admin_emails(email) values ('support@ridgemate.app'), ('support@useruva.com'), ('thadjacobs@useruva.com') on conflict do nothing;
+
+-- Prospects: roofing companies you're talking to
+create table if not exists public.hq_prospects (
+  id bigint generated always as identity primary key,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  company text not null default '',
+  contact text not null default '',
+  phone text not null default '',
+  email text not null default '',
+  town text not null default '',
+  stage text not null default 'To call',
+  source text not null default '',
+  current_tool text not null default '',
+  current_cost text not null default '',
+  users text not null default '',
+  next_step text not null default '',
+  next_date date,
+  notes text not null default '',
+  log jsonb not null default '[]'::jsonb
+);
+alter table public.hq_prospects enable row level security;
+revoke all on public.hq_prospects from anon, authenticated;
+
+-- Launch checklist
+create table if not exists public.hq_tasks (
+  id bigint generated always as identity primary key,
+  created_at timestamptz not null default now(),
+  title text not null,
+  area text not null default 'Launch',
+  done boolean not null default false,
+  due date,
+  note text not null default '',
+  sort int not null default 0
+);
+alter table public.hq_tasks enable row level security;
+revoke all on public.hq_tasks from anon, authenticated;
+
+create or replace function public._hq_guard() returns void language plpgsql stable security definer set search_path = public as $$
+begin if not public.is_platform_admin() then raise exception 'Not allowed'; end if; end $$;
+
+create or replace function public.hq_prospects() returns setof public.hq_prospects
+language plpgsql stable security definer set search_path = public as $$
+begin perform _hq_guard(); return query select * from hq_prospects order by updated_at desc; end $$;
+
+create or replace function public.hq_prospect_save(p jsonb) returns bigint
+language plpgsql security definer set search_path = public as $$
+declare v_id bigint := nullif(p->>'id','')::bigint;
+begin
+  perform _hq_guard();
+  if v_id is null then
+    insert into hq_prospects(company) values (coalesce(p->>'company','')) returning id into v_id;
+  end if;
+  update hq_prospects set
+    company = coalesce(p->>'company', company), contact = coalesce(p->>'contact', contact),
+    phone = coalesce(p->>'phone', phone), email = coalesce(p->>'email', email), town = coalesce(p->>'town', town),
+    stage = coalesce(p->>'stage', stage), source = coalesce(p->>'source', source),
+    current_tool = coalesce(p->>'current_tool', current_tool), current_cost = coalesce(p->>'current_cost', current_cost),
+    users = coalesce(p->>'users', users), next_step = coalesce(p->>'next_step', next_step),
+    next_date = case when p ? 'next_date' then nullif(p->>'next_date','')::date else next_date end,
+    notes = coalesce(p->>'notes', notes),
+    log = case when p ? 'log_add' then log || jsonb_build_array(jsonb_build_object('t', now(), 'text', p->>'log_add')) else log end,
+    updated_at = now()
+  where id = v_id;
+  return v_id;
+end $$;
+
+create or replace function public.hq_prospect_delete(p_id bigint) returns void
+language plpgsql security definer set search_path = public as $$
+begin perform _hq_guard(); delete from hq_prospects where id = p_id; end $$;
+
+create or replace function public.hq_feedback() returns setof public.feedback
+language plpgsql stable security definer set search_path = public as $$
+begin perform _hq_guard(); return query select * from feedback order by created_at desc limit 500; end $$;
+
+create or replace function public.hq_tasks() returns setof public.hq_tasks
+language plpgsql stable security definer set search_path = public as $$
+begin perform _hq_guard(); return query select * from hq_tasks order by done, sort, id; end $$;
+
+create or replace function public.hq_task_save(p jsonb) returns bigint
+language plpgsql security definer set search_path = public as $$
+declare v_id bigint := nullif(p->>'id','')::bigint;
+begin
+  perform _hq_guard();
+  if v_id is null then insert into hq_tasks(title, area, sort) values (coalesce(nullif(p->>'title',''),'New task'), coalesce(nullif(p->>'area',''),'Launch'), 999) returning id into v_id; end if;
+  update hq_tasks set title = coalesce(nullif(p->>'title',''), title), area = coalesce(nullif(p->>'area',''), area),
+    done = coalesce((p->>'done')::boolean, done), note = coalesce(p->>'note', note),
+    due = case when p ? 'due' then nullif(p->>'due','')::date else due end
+  where id = v_id;
+  return v_id;
+end $$;
+
+create or replace function public.hq_task_delete(p_id bigint) returns void
+language plpgsql security definer set search_path = public as $$
+begin perform _hq_guard(); delete from hq_tasks where id = p_id; end $$;
+
+-- Website "Save a founding spot" form
+create or replace function public.request_founding(p jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+declare v_co text := left(coalesce(p->>'company',''), 120);
+begin
+  if p is null or jsonb_typeof(p) <> 'object' or pg_column_size(p) > 8000 then raise exception 'Bad form'; end if;
+  if v_co = '' or coalesce(p->>'contact','') = '' then raise exception 'Add your name and company'; end if;
+  insert into hq_prospects(company, contact, phone, email, town, users, current_tool, stage, source, notes, log)
+  values (v_co, left(p->>'contact',80), left(coalesce(p->>'phone',''),40), left(coalesce(p->>'email',''),120), left(coalesce(p->>'town',''),80),
+    left(coalesce(p->>'users',''),20), left(coalesce(p->>'current_tool',''),80), 'New request', 'Website', left(coalesce(p->>'notes',''),2000),
+    jsonb_build_array(jsonb_build_object('t', now(), 'text', 'Asked for a founding spot on useruva.com')));
+  begin
+    perform public._push(array(select u.id from auth.users u where lower(u.email) in (select lower(email) from platform_admin_emails) or lower(u.email) = 'thaddeusjreugene@icloud.com'),
+      'feedback', 'Founding spot request', v_co || ' · ' || left(p->>'contact',60), './', 'founding');
+  exception when others then null; end;
+end $$;
+revoke all on function public.request_founding(jsonb) from public;
+grant execute on function public.request_founding(jsonb) to anon, authenticated;
+revoke all on function public.hq_prospects(), public.hq_prospect_save(jsonb), public.hq_prospect_delete(bigint), public.hq_feedback(), public.hq_tasks(), public.hq_task_save(jsonb), public.hq_task_delete(bigint), public._hq_guard() from public;
+grant execute on function public.hq_prospects(), public.hq_prospect_save(jsonb), public.hq_prospect_delete(bigint), public.hq_feedback(), public.hq_tasks(), public.hq_task_save(jsonb), public.hq_task_delete(bigint), public._hq_guard() to authenticated;
+
+-- Starting data (only the first time)
+do $$ begin
+  if not exists (select 1 from hq_prospects) then
+    insert into hq_prospects(company, contact, town, stage, source, current_tool, current_cost, next_step, notes, log) values
+      ('Response Roofing', 'Gavin Flynn', 'Lancaster, SC', 'Demo done', 'Family', 'AccuLynx', '$490/mo, no add-ons',
+       'Send feedback form. Schedule follow-up in person.',
+       'Met 11/10. 60% insurance / 40% retail. GAF HDZ. Liked: rep app, Today screen, scope import and supplements, homeowner view. Biggest AccuLynx complaint: how material orders work. Builds orders from templates. Uses QuickBooks and EagleView, won''t switch without both. Said $299 for up to 5 users would still be worth it.',
+       jsonb_build_array(jsonb_build_object('t', '2026-11-10', 'text', 'First meeting and demo'))),
+      ('Ben Ross Roofing', '', 'Rock Hill, SC', 'To call', 'Cold call', '', '', 'Call (803) 327-7677', '', '[]'),
+      ('Rodríguez Roofing', '', '', 'To call', 'Cold call', '', '', 'Find the owner and call', '', '[]'),
+      ('Innovation Restoration', '', '', 'To call', 'Cold call', '', '', 'Find the owner and call', '', '[]');
+  end if;
+  if not exists (select 1 from hq_tasks) then
+    insert into hq_tasks(title, area, sort, note) values
+      ('Apply for the QuickBooks Online app (Intuit developer)', 'Partners', 1, 'Gavin won''t switch without it.'),
+      ('Apply for EagleView ordering access', 'Partners', 2, 'Gavin won''t switch without it.'),
+      ('Apply to Hover and GAF QuickMeasure partner programs', 'Partners', 3, ''),
+      ('Supplier ordering: ABC Supply, SRS, Beacon', 'Partners', 4, ''),
+      ('Lawyer review: terms, privacy, customer agreement', 'Legal', 10, ''),
+      ('Form RUVA Inc. or LLC and get an EIN', 'Legal', 11, ''),
+      ('Register for SC sales tax on software (SaaS is taxable in SC)', 'Legal', 12, ''),
+      ('Turn on live Stripe billing at the RUVA price', 'Money', 20, 'App still shows the old Solo/Team prices.'),
+      ('Email sending service for vendor orders and job emails', 'Product', 30, 'About $20/mo.'),
+      ('Saved material order templates', 'Product', 31, 'Promised to Gavin.'),
+      ('Switch the office to the new dashboard', 'Product', 32, 'After Gavin tests dashboard-new.'),
+      ('Get useruva.com categorized by web filters', 'Product', 33, 'Blocked on the Nutramax network as a new domain.'),
+      ('Demo login for showing RUVA', 'Sales', 40, ''),
+      ('Line up 2–3 more small roofers to pitch', 'Sales', 41, '');
+  end if;
+end $$;
+
+-- RUVA beta: "Report a problem" from the app and dashboard, read in RUVA HQ.
+-- Safe to run more than once.
+
+create table if not exists public.beta_reports (
+  id bigint generated always as identity primary key,
+  created_at timestamptz not null default now(),
+  user_id uuid,
+  email text not null default '',
+  workspace text not null default '',
+  kind text not null default 'Bug',
+  body text not null,
+  where_at text not null default '',
+  device text not null default '',
+  status text not null default 'New',
+  note text not null default ''
+);
+alter table public.beta_reports enable row level security;
+revoke all on public.beta_reports from anon, authenticated;
+
+-- Anyone signed in can send a report. They can't read anyone else's.
+create or replace function public.report_problem(p_kind text, p_body text, p_where text, p_device text, p_ws uuid default null)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare v_id bigint; v_email text; v_ws text;
+begin
+  if auth.uid() is null then raise exception 'Sign in first'; end if;
+  if coalesce(trim(p_body), '') = '' then raise exception 'Tell us what happened'; end if;
+  select email into v_email from auth.users where id = auth.uid();
+  select name into v_ws from workspaces where id = p_ws and exists (select 1 from members m where m.workspace_id = p_ws and m.user_id = auth.uid());
+  insert into beta_reports(user_id, email, workspace, kind, body, where_at, device)
+  values (auth.uid(), coalesce(v_email, ''), coalesce(v_ws, ''), left(coalesce(nullif(p_kind, ''), 'Bug'), 20), left(p_body, 4000), left(coalesce(p_where, ''), 300), left(coalesce(p_device, ''), 300))
+  returning id into v_id;
+  return v_id;
+end $$;
+grant execute on function public.report_problem(text, text, text, text, uuid) to authenticated;
+
+create or replace function public._beta_notify() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._push(array(select id from auth.users where lower(email) in ('thaddeusjreugene@icloud.com', 'thadjacobsjr@icloud.com', 'thadjacobs@useruva.com')), 'beta',
+    'Beta ' || lower(new.kind) || coalesce(' from ' || nullif(new.workspace, ''), ''), left(new.body, 140), 'https://useruva.com/admin/#beta', 'beta');
+  return new;
+exception when others then return new;
+end $$;
+drop trigger if exists beta_notify on public.beta_reports;
+create trigger beta_notify after insert on public.beta_reports for each row execute function public._beta_notify();
+
+-- RUVA HQ
+create or replace function public.hq_beta() returns setof public.beta_reports
+language plpgsql stable security definer set search_path = public as $$
+begin perform _hq_guard(); return query select * from beta_reports order by (status = 'Fixed'), created_at desc limit 500; end $$;
+
+create or replace function public.hq_beta_save(p_id bigint, p_status text, p_note text) returns void
+language plpgsql security definer set search_path = public as $$
+begin perform _hq_guard(); update beta_reports set status = coalesce(nullif(p_status, ''), status), note = coalesce(p_note, note) where id = p_id; end $$;
+
+grant execute on function public.hq_beta() to authenticated;
+grant execute on function public.hq_beta_save(bigint, text, text) to authenticated;
+
