@@ -2182,8 +2182,10 @@ body.auth .top [data-act="report"]{display:none}
 .ph.bad b{font-size:22px;line-height:1}.ph.bad span:not(.tag){font-weight:800;font-size:13px}.ph.bad small{font-size:10.5px;opacity:.85}
 @media (prefers-color-scheme:dark){.badpic,.ph.bad{background:#55160C;color:#FDA29B}.bl-h{color:#FDA29B}}
 .secflag{margin-left:8px;font-size:12.5px;font-weight:800;color:#fff;background:#D92D20;border-radius:999px;padding:2px 8px;vertical-align:2px}
-.li.badrow{flex-wrap:wrap;row-gap:4px}.li.badrow .badpic{order:3;flex:0 0 auto;white-space:nowrap;margin-top:0}
-.li.badrow .badpic{font-weight:500}
+.li.badrow{display:flex;flex-direction:column;align-items:stretch;gap:6px}
+.li.badrow .br-top{display:flex;align-items:center;gap:10px;min-width:0}
+.li.badrow .br-name{flex:1 1 auto;min-width:0;font-weight:600;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li.badrow .badpic{align-self:flex-start;white-space:nowrap;margin-top:0;font-weight:400}
 </style>
 </head>
 <body>
@@ -2780,7 +2782,7 @@ Suggested solution: ${e.workaround}`),new Error(t)}static isWebSocketSupported()
     <div class="grid2">${sel("roof.condition","Condition",l,["","Good","Fair","Worn","Failing"])}${inp("roof.pitch","Pitch",l,"text","6/12")}</div>
     <div class="micwrap">${ta("findings","Inspection findings",l,"Hits per test square, soft metal damage, creased tabs, granule loss\u2026")}<button class="mic" data-mic="#f-findings" aria-label="Talk to add findings" aria-pressed="false">${MIC_SVG}</button></div>
     <div><div class="label" style="margin-bottom:6px">Measurement reports & documents</div>
-      ${l.docs.length?`<div class="list card" style="margin-bottom:8px">${l.docs.map((d,i)=>d.failed&&!d.asset?`<div class="li badrow" style="cursor:default"><b class="grow trunc" style="min-width:0">${esc(d.name)}</b><button class="btn sm dng" data-deldoc="${i}">Remove</button><span class="badpic">\u2691 Didn\u2019t upload, remove, and reattach</span></div>`:`<div class="li" style="cursor:default"><span class="grow trunc">${fileSrc(d)?`<a href="${esc(fileSrc(d))}" target="_blank" rel="noopener">${esc(d.name)}</a>`:esc(d.name)+(d.asset?' <span class="muted">(loading\u2026)</span>':' <span class="muted">(waiting to back up)</span>')}<span class="t2" style="display:block">${fmtStamp(d.t)}</span></span>${!d.staff||viewAll()?`<button class="btn sm dng" data-deldoc="${i}">Remove</button>`:'<span class="muted" style="font-size:12.5px">From the office</span>'}</div>`).join("")}</div>`:""}
+      ${l.docs.length?`<div class="list card" style="margin-bottom:8px">${l.docs.map((d,i)=>d.failed&&!d.asset?`<div class="li badrow" style="cursor:default"><div class="br-top"><span class="br-name">${esc(d.name)}</span><button class="btn sm dng" data-deldoc="${i}">Remove</button></div><span class="badpic">\u2691 Didn\u2019t upload, remove, and reattach</span></div>`:`<div class="li" style="cursor:default"><span class="grow trunc">${fileSrc(d)?`<a href="${esc(fileSrc(d))}" target="_blank" rel="noopener">${esc(d.name)}</a>`:esc(d.name)+(d.asset?' <span class="muted">(loading\u2026)</span>':' <span class="muted">(waiting to back up)</span>')}<span class="t2" style="display:block">${fmtStamp(d.t)}</span></span>${!d.staff||viewAll()?`<button class="btn sm dng" data-deldoc="${i}">Remove</button>`:'<span class="muted" style="font-size:12.5px">From the office</span>'}</div>`).join("")}</div>`:""}
       <div class="btns"><label class="btn sm" style="position:relative">Attach PDF or image<input type="file" accept="application/pdf,image/*" data-doc style="position:absolute;inset:0;opacity:0;width:100%"></label>
       ${measBtnsHTML(l)}</div>${measStatusHTML(l)}</div>`;const storms=l.storms.map((s,i)=>`<div class="card pad" style="background:var(--bg);display:flex;flex-direction:column;gap:8px">
       <div class="grid2"><label class="field"><span>Storm date</span><input type="date" data-storm="${i}" data-k="date" id="st-${i}-date" value="${esc(s.date||"")}"></label>
