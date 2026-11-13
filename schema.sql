@@ -2235,3 +2235,127 @@ begin perform _hq_guard(); update beta_reports set status = coalesce(nullif(p_st
 grant execute on function public.hq_beta() to authenticated;
 grant execute on function public.hq_beta_save(bigint, text, text) to authenticated;
 
+-- 7. Homeowner link: a private page per job. No login. View progress, pick Good/Better/Best, review and sign.
+
+-- One private link per job. Turning it off kills the link.
+create table if not exists public.ho_links (
+  token        text primary key check (length(token) >= 24),
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id      text not null unique,
+  created_by   uuid not null default auth.uid(),
+  created_at   timestamptz not null default now(),
+  revoked_at   timestamptz
+);
+alter table public.ho_links enable row level security;
+drop policy if exists ho_links_rw on public.ho_links;
+create policy ho_links_rw on public.ho_links for select to authenticated
+  using (public.is_member(workspace_id) and public.can_see_lead(lead_id));
+revoke all on public.ho_links from anon;
+
+-- Rep or office: make (or reuse) the job's link, and save the three options the homeowner will see.
+-- p_offer = {sq, tiers:[{n, name, per, inc}]} built by the app from the job's own prices.
+create or replace function public.ho_link(p_lead text, p_offer jsonb default null) returns text
+language plpgsql security definer set search_path = public as $$
+declare l leads; t text;
+begin
+  select * into l from leads where id = p_lead;
+  if l.id is null or not public.is_member(l.workspace_id) or not public.can_see_lead(p_lead) then raise exception 'not allowed'; end if;
+  select token into t from ho_links where lead_id = p_lead and revoked_at is null;
+  if t is null then
+    t := replace(gen_random_uuid()::text, '-', '');
+    insert into ho_links(token, workspace_id, lead_id) values (t, l.workspace_id, p_lead)
+      on conflict (lead_id) do update set token = excluded.token, revoked_at = null, created_at = now(), created_by = auth.uid();
+  end if;
+  if p_offer is not null and jsonb_typeof(p_offer->'tiers') = 'array' then
+    update leads set data = jsonb_set(data, '{ho}', coalesce(data->'ho','{}'::jsonb) || jsonb_build_object('offer', p_offer, 'offerAt', (extract(epoch from now())*1000)::bigint)) where id = p_lead;
+  end if;
+  return t;
+end $$;
+
+create or replace function public.ho_unlink(p_lead text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not exists (select 1 from leads where id = p_lead and public.is_member(workspace_id) and public.can_see_lead(p_lead)) then raise exception 'not allowed'; end if;
+  update ho_links set revoked_at = now() where lead_id = p_lead;
+end $$;
+
+-- What the homeowner sees. Only these fields leave the database: never costs, crew pay, commission, notes or other jobs.
+create or replace function public.ho_view(p_token text) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare k ho_links; l leads; w workspaces; e jsonb; tot numeric := 0; rep text;
+begin
+  select * into k from ho_links where token = p_token and length(p_token) >= 24 and revoked_at is null;
+  if k.token is null then return null; end if;
+  select * into l from leads where id = k.lead_id;
+  if l.id is null then return null; end if;
+  select * into w from workspaces where id = l.workspace_id;
+  e := coalesce(l.data->'est', '{}'::jsonb);
+  select coalesce(sum(coalesce(nullif(regexp_replace(x->>'q','[^0-9.]','','g'),'')::numeric,0) * coalesce(nullif(regexp_replace(x->>'p','[^0-9.-]','','g'),'')::numeric,0)),0)
+    into tot from jsonb_array_elements(coalesce(e->'lines','[]'::jsonb)) x;
+  rep := case when l.owner_id is not null then split_part(public._push_name(l.workspace_id, l.owner_id), ' ', 1) end;
+  return jsonb_build_object(
+    'company', jsonb_build_object('name', w.name, 'phone', w.settings->'profile'->>'phone', 'logo', w.settings->'profile'->>'logo', 'license', w.settings->'profile'->>'license'),
+    'rep', rep,
+    'name', l.name, 'address', trim(concat_ws(' ', l.num, l.street)), 'city', l.city,
+    'type', coalesce(l.data->'sale'->>'type', 'Insurance'),
+    'status', l.status, 'stage', l.data->'sale'->>'stage',
+    'install', l.data->'sale'->'install'->>'at',
+    'offer', l.data->'ho'->'offer',
+    'pick', e->'pick',
+    'contract', case when coalesce(l.data->'sale'->'er'->>'st','') = 'ready' and tot > 0 then jsonb_build_object(
+        'total', round(tot, 2),
+        'lines', (select jsonb_agg(x->>'d') from jsonb_array_elements(coalesce(e->'lines','[]'::jsonb)) x where coalesce(x->>'d','') <> ''),
+        'terms', w.settings->>'terms') end,
+    'signed', case when coalesce(e->>'sigAt','') <> '' then jsonb_build_object('name', e->>'sigName', 'at', e->>'sigAt') end
+  );
+end $$;
+
+-- Homeowner picks an option. Fills the contract's main line, logs it, and tells the rep and office.
+create or replace function public.ho_pick(p_token text, p_i int) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k ho_links; l leads; t jsonb; sq numeric; ln jsonb; who uuid[];
+begin
+  select * into k from ho_links where token = p_token and revoked_at is null;
+  if k.token is null then raise exception 'link not found'; end if;
+  select * into l from leads where id = k.lead_id for update;
+  if coalesce(l.data->'est'->>'sigAt','') <> '' then raise exception 'already signed'; end if;
+  t := l.data->'ho'->'offer'->'tiers'->p_i;
+  if t is null then raise exception 'no such option'; end if;
+  sq := coalesce(nullif(l.data->'ho'->'offer'->>'sq','')::numeric, 0);
+  ln := jsonb_build_object('d', 'Tear off and replace · ' || coalesce(t->>'name','') || ' (' || (t->>'n') || ')', 'q', sq::text, 'u', 'SQ', 'p', t->>'per', 'tier', 1);
+  update leads set data = jsonb_set(jsonb_set(jsonb_set(data,
+      '{est,lines}', jsonb_build_array(ln) || coalesce((select jsonb_agg(x) from jsonb_array_elements(coalesce(data->'est'->'lines','[]'::jsonb)) x where coalesce((x->>'tier')::int,0) <> 1), '[]'::jsonb)),
+      '{est,pick}', to_jsonb(p_i)),
+      '{log}', coalesce(data->'log','[]'::jsonb) || jsonb_build_array(jsonb_build_object('t', (extract(epoch from now())*1000)::bigint, 'text', 'Homeowner picked ' || (t->>'n') || ' from their link · $' || to_char(sq * (t->>'per')::numeric, 'FM999,999,990'))))
+    where id = l.id;
+  who := array(select user_id from members where workspace_id = l.workspace_id and active and not support and (role in ('owner','manager','office') or user_id = l.owner_id));
+  perform public._push(who, 'jobs', 'Homeowner picked ' || (t->>'n'), public._push_addr(l) || ' · $' || to_char(sq * (t->>'per')::numeric, 'FM999,999,990'), './?lead=' || l.id || '#leads', 'ho:' || l.id);
+  return public.ho_view(p_token);
+end $$;
+
+-- Homeowner signs. Only when the office has sent the contract. Stores the drawn signature; the existing
+-- "Contract signed" alert fires on its own.
+create or replace function public.ho_sign(p_token text, p_name text, p_img text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k ho_links; l leads; now_ms bigint := (extract(epoch from now())*1000)::bigint;
+begin
+  select * into k from ho_links where token = p_token and revoked_at is null;
+  if k.token is null then raise exception 'link not found'; end if;
+  select * into l from leads where id = k.lead_id for update;
+  if coalesce(l.data->'sale'->'er'->>'st','') <> 'ready' then raise exception 'contract not ready'; end if;
+  if coalesce(l.data->'est'->>'sigAt','') <> '' then raise exception 'already signed'; end if;
+  if length(trim(coalesce(p_name,''))) < 2 then raise exception 'name required'; end if;
+  if p_img is null or p_img not like 'data:image/png;base64,%' or length(p_img) > 300000 then raise exception 'bad signature'; end if;
+  update leads set data = jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
+      '{est,hoSig}', jsonb_build_object('img', p_img, 'name', trim(p_name), 'at', now_ms)),
+      '{est,sigName}', to_jsonb(trim(p_name))),
+      '{est,sigAt}', to_jsonb(to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+      '{log}', coalesce(data->'log','[]'::jsonb) || jsonb_build_array(jsonb_build_object('t', now_ms, 'text', 'Homeowner signed the contract from their link')))
+    where id = l.id;
+  return public.ho_view(p_token);
+end $$;
+
+revoke execute on function public.ho_link(text, jsonb), public.ho_unlink(text) from public, anon;
+grant execute on function public.ho_link(text, jsonb), public.ho_unlink(text) to authenticated;
+revoke execute on function public.ho_view(text), public.ho_pick(text, int), public.ho_sign(text, text, text) from public;
+grant execute on function public.ho_view(text), public.ho_pick(text, int), public.ho_sign(text, text, text) to anon, authenticated;
