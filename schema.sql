@@ -2397,3 +2397,125 @@ begin
     'signed', case when coalesce(e->>'sigAt','') <> '' then jsonb_build_object('name', e->>'sigName', 'at', e->>'sigAt') end
   );
 end $$;
+
+
+-- 9. QuickBooks Online connection.
+-- Tokens are encrypted by the "qbo" Edge Function before they get here (AES-GCM; the key lives in the
+-- function's secrets, never in the database). Nobody signed in to RUVA can read these tables directly:
+-- only the Edge Function (service role) can. The dashboard reads a safe summary through qbo_status().
+
+create table if not exists public.qbo_conn (
+  workspace_id  uuid primary key references public.workspaces(id) on delete cascade,
+  env           text not null default 'sandbox' check (env in ('sandbox','production')),
+  realm_hash    text not null,                 -- sha-256 of the QuickBooks company id (to match without decrypting)
+  realm_enc     text not null,                 -- QuickBooks company id, encrypted
+  access_enc    text not null,                 -- access token, encrypted (lasts 1 hour)
+  refresh_enc   text not null,                 -- refresh token, encrypted
+  access_exp    timestamptz not null,
+  refresh_exp   timestamptz,
+  company       text not null default '',      -- QuickBooks company name, shown in Settings
+  connected_by  uuid,
+  connected_at  timestamptz not null default now(),
+  status        text not null default 'connected' check (status in ('connected','reconnect')),
+  last_error    text not null default '',
+  last_sync_at  timestamptz,
+  pull_cursor   timestamptz,                   -- payments and expenses changed in QuickBooks after this come back
+  sync_lock     timestamptz                    -- one sync at a time per company
+);
+
+-- Sign-in handshakes. Each one is single-use and good for 10 minutes (stops forged callbacks).
+create table if not exists public.qbo_state (
+  state        text primary key check (length(state) >= 32),
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  user_id      uuid not null,
+  return_url   text not null default '',
+  created_at   timestamptz not null default now()
+);
+
+-- Which QuickBooks record each RUVA thing became, so nothing is sent twice.
+-- kind: cust, job, inv, pay, bill, vend, item, acct
+create table if not exists public.qbo_map (
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  realm_hash   text not null,
+  kind         text not null,
+  ruva_key     text not null,
+  qbo_id       text not null,
+  sync_token   text not null default '',
+  hash         text not null default '',
+  synced_at    timestamptz not null default now(),
+  gone_at      timestamptz,                    -- set on disconnect; erased 30 days later (Intuit rule)
+  primary key (workspace_id, realm_hash, kind, ruva_key)
+);
+create index if not exists qbo_map_qid on public.qbo_map(workspace_id, realm_hash, kind, qbo_id);
+
+-- Short activity list for Settings → Integrations.
+create table if not exists public.qbo_log (
+  id           bigserial primary key,
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  at           timestamptz not null default now(),
+  ok           boolean not null default true,
+  msg          text not null,
+  lead_id      text
+);
+create index if not exists qbo_log_ws on public.qbo_log(workspace_id, at desc);
+
+alter table public.qbo_conn  enable row level security;
+alter table public.qbo_state enable row level security;
+alter table public.qbo_map   enable row level security;
+alter table public.qbo_log   enable row level security;
+revoke all on public.qbo_conn, public.qbo_state, public.qbo_map, public.qbo_log from anon, authenticated;
+do $$ begin
+  execute 'grant all on public.qbo_conn, public.qbo_state, public.qbo_map, public.qbo_log to service_role';
+  execute 'grant usage, select on sequence public.qbo_log_id_seq to service_role';
+exception when others then null; end $$;
+
+-- One secret the daily check sends, so nobody else can trigger it.
+create table if not exists public.qbo_cfg (id int primary key default 1 check (id = 1), cron_token text not null);
+alter table public.qbo_cfg enable row level security;
+revoke all on public.qbo_cfg from anon, authenticated;
+do $$ begin execute 'grant all on public.qbo_cfg to service_role'; exception when others then null; end $$;
+insert into public.qbo_cfg(id, cron_token) values (1, encode(gen_random_bytes(32), 'hex')) on conflict (id) do nothing;
+
+-- What the office sees. Never tokens or the company id.
+create or replace function public.qbo_status(ws uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare c qbo_conn;
+begin
+  if not public.can_view_all(ws) then raise exception 'not allowed'; end if;
+  select * into c from qbo_conn where workspace_id = ws;
+  return jsonb_build_object(
+    'connected', c.workspace_id is not null,
+    'can_connect', public.is_manager(ws),
+    'status', c.status, 'env', c.env, 'company', c.company,
+    'connected_at', c.connected_at, 'connected_by', c.connected_by,
+    'last_sync_at', c.last_sync_at, 'refresh_exp', c.refresh_exp, 'last_error', c.last_error,
+    'jobs', (select count(*) from qbo_map m where m.workspace_id = ws and m.kind = 'job' and m.gone_at is null),
+    'log', coalesce((select jsonb_agg(jsonb_build_object('at', l.at, 'ok', l.ok, 'msg', l.msg, 'lead', l.lead_id) order by l.at desc)
+                     from (select * from qbo_log where workspace_id = ws order by at desc limit 12) l), '[]'::jsonb),
+    'synced', coalesce((select jsonb_object_agg(m.ruva_key, m.qbo_id) from qbo_map m
+                        where m.workspace_id = ws and m.kind = 'inv' and m.gone_at is null), '{}'::jsonb));
+end $$;
+revoke execute on function public.qbo_status(uuid) from public, anon;
+grant execute on function public.qbo_status(uuid) to authenticated;
+
+-- Daily clean-up: QuickBooks ids from a disconnected company are erased after 30 days,
+-- expired handshakes after a day, activity older than 90 days.
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    perform cron.schedule('ruva-qbo-purge', '45 7 * * *', $c$
+      delete from public.qbo_map   where gone_at < now() - interval '30 days';
+      delete from public.qbo_state where created_at < now() - interval '1 day';
+      delete from public.qbo_log   where at < now() - interval '90 days';$c$);
+  end if;
+exception when others then null; end $$;
+
+-- Daily check of every connection (keeps sign-ins from expiring; catches a disconnect made inside QuickBooks).
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') and exists (select 1 from pg_extension where extname = 'pg_net') then
+    perform cron.schedule('ruva-qbo-check', '20 8 * * *', $c$
+      select net.http_post(
+        url := 'https://fixqhaewtyddieoimmrv.supabase.co/functions/v1/qbo',
+        headers := jsonb_build_object('Content-Type', 'application/json'),
+        body := jsonb_build_object('action', 'cron', 'token', (select cron_token from public.qbo_cfg where id = 1)));$c$);
+  end if;
+exception when others then null; end $$;
