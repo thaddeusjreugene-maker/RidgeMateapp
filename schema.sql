@@ -2359,3 +2359,41 @@ revoke execute on function public.ho_link(text, jsonb), public.ho_unlink(text) f
 grant execute on function public.ho_link(text, jsonb), public.ho_unlink(text) to authenticated;
 revoke execute on function public.ho_view(text), public.ho_pick(text, int), public.ho_sign(text, text, text) from public;
 grant execute on function public.ho_view(text), public.ho_pick(text, int), public.ho_sign(text, text, text) to anon, authenticated;
+-- 8. Homeowner page: name the roof they're getting, and keep showing the contract after it's signed.
+create or replace function public.ho_view(p_token text) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare k ho_links; l leads; w workspaces; e jsonb; tot numeric := 0; rep text; pid text; roof text;
+begin
+  select * into k from ho_links where token = p_token and length(p_token) >= 24 and revoked_at is null;
+  if k.token is null then return null; end if;
+  select * into l from leads where id = k.lead_id;
+  if l.id is null then return null; end if;
+  select * into w from workspaces where id = l.workspace_id;
+  e := coalesce(l.data->'est', '{}'::jsonb);
+  select coalesce(sum(coalesce(nullif(regexp_replace(x->>'q','[^0-9.]','','g'),'')::numeric,0) * coalesce(nullif(regexp_replace(x->>'p','[^0-9.-]','','g'),'')::numeric,0)),0)
+    into tot from jsonb_array_elements(coalesce(e->'lines','[]'::jsonb)) x;
+  rep := case when l.owner_id is not null then split_part(public._push_name(l.workspace_id, l.owner_id), ' ', 1) end;
+  -- The roof system on the contract: product name from the company's catalog (Atlas built-ins as a fallback) plus the color.
+  pid := e->'sys'->>'pid';
+  if pid is not null then
+    select trim(concat_ws(' ', nullif(nullif(c->>'brand',''),'Any'), c->>'name')) into roof from jsonb_array_elements(coalesce(w.settings->'catalog','[]'::jsonb)) c where c->>'id' = pid limit 1;
+    if roof is null then roof := case pid when 'a1' then 'Atlas Pinnacle Pristine' end; end if;
+  end if;
+  if roof is not null and coalesce(e->'sys'->>'color', e->>'color', '') <> '' then roof := roof || ' · ' || coalesce(nullif(e->'sys'->>'color',''), e->>'color'); end if;
+  return jsonb_build_object(
+    'company', jsonb_build_object('name', w.name, 'phone', w.settings->'profile'->>'phone', 'logo', w.settings->'profile'->>'logo', 'license', w.settings->'profile'->>'license'),
+    'rep', rep,
+    'name', l.name, 'address', trim(concat_ws(' ', l.num, l.street)), 'city', l.city,
+    'type', coalesce(l.data->'sale'->>'type', 'Insurance'),
+    'status', l.status, 'stage', l.data->'sale'->>'stage',
+    'install', l.data->'sale'->'install'->>'at',
+    'offer', l.data->'ho'->'offer',
+    'pick', e->'pick',
+    'roof', roof,
+    'contract', case when (coalesce(l.data->'sale'->'er'->>'st','') = 'ready' or coalesce(e->>'sigAt','') <> '') and tot > 0 then jsonb_build_object(
+        'total', round(tot, 2),
+        'lines', (select jsonb_agg(x->>'d') from jsonb_array_elements(coalesce(e->'lines','[]'::jsonb)) x where coalesce(x->>'d','') <> ''),
+        'terms', w.settings->>'terms') end,
+    'signed', case when coalesce(e->>'sigAt','') <> '' then jsonb_build_object('name', e->>'sigName', 'at', e->>'sigAt') end
+  );
+end $$;
