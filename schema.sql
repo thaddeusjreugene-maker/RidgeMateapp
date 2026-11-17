@@ -2519,3 +2519,142 @@ do $$ begin
         body := jsonb_build_object('action', 'cron', 'token', (select cron_token from public.qbo_cfg where id = 1)));$c$);
   end if;
 exception when others then null; end $$;
+
+
+-- 11. AccuLynx connection: leads set in RUVA show up in the company's AccuLynx as a contact + job,
+-- with the rep as sales owner, notes as job messages, and photos in the job's Photos folder.
+-- The API key is encrypted by the "acculynx" Edge Function before it gets here. Nobody signed in to RUVA
+-- can read these tables; the dashboard and app read safe summaries through acx_status() and acx_lead().
+
+create table if not exists public.acx_conn (
+  workspace_id uuid primary key references public.workspaces(id) on delete cascade,
+  key_enc      text not null,                 -- AccuLynx API key, encrypted
+  company      text not null default '',      -- AccuLynx company/location name
+  connected_by uuid,
+  connected_at timestamptz not null default now(),
+  status       text not null default 'connected' check (status in ('connected','reconnect')),
+  last_error   text not null default '',
+  last_sync_at timestamptz,
+  settings     jsonb not null default '{}'::jsonb,   -- leadSourceId, statuses[], contactTypeId
+  lists        jsonb not null default '{}'::jsonb    -- lead sources and users from AccuLynx, for the settings screen
+);
+
+-- Which AccuLynx contact and job each RUVA lead became, and what has been sent since.
+create table if not exists public.acx_map (
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id      text not null,
+  contact_id   text,
+  job_id       text,
+  job_number   text not null default '',
+  sent         jsonb not null default '{}'::jsonb,   -- {status, logT, photos:[ids]}
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  primary key (workspace_id, lead_id)
+);
+
+-- Leads waiting to go over. A change to a lead lands here; a job every minute sends them.
+create table if not exists public.acx_queue (
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id      text not null,
+  queued_at    timestamptz not null default now(),
+  next_at      timestamptz not null default now(),
+  tries        int not null default 0,
+  primary key (workspace_id, lead_id)
+);
+create index if not exists acx_queue_due on public.acx_queue(next_at);
+
+create table if not exists public.acx_log (
+  id           bigserial primary key,
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  at           timestamptz not null default now(),
+  ok           boolean not null default true,
+  msg          text not null,
+  lead_id      text
+);
+create index if not exists acx_log_ws on public.acx_log(workspace_id, at desc);
+
+create table if not exists public.acx_cfg (id int primary key default 1 check (id = 1), cron_token text not null);
+insert into public.acx_cfg(id, cron_token) values (1, encode(gen_random_bytes(32), 'hex')) on conflict (id) do nothing;
+
+alter table public.acx_conn  enable row level security;
+alter table public.acx_map   enable row level security;
+alter table public.acx_queue enable row level security;
+alter table public.acx_log   enable row level security;
+alter table public.acx_cfg   enable row level security;
+revoke all on public.acx_conn, public.acx_map, public.acx_queue, public.acx_log, public.acx_cfg from anon, authenticated;
+do $$ begin
+  execute 'grant all on public.acx_conn, public.acx_map, public.acx_queue, public.acx_log, public.acx_cfg to service_role';
+  execute 'grant usage, select on sequence public.acx_log_id_seq to service_role';
+exception when others then null; end $$;
+
+-- A lead changed: if the company is connected and the lead is at a status that goes to AccuLynx
+-- (or already went), put it in line. Waits 30 seconds so a rep's burst of edits goes as one send.
+create or replace function public._acx_on_lead() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare st jsonb;
+begin
+  select settings->'statuses' into st from acx_conn where workspace_id = new.workspace_id and status = 'connected';
+  if not found then return new; end if;
+  if tg_op = 'UPDATE' and new.status is not distinct from old.status and new.data is not distinct from old.data
+     and new.name is not distinct from old.name and new.phone is not distinct from old.phone then return new; end if;
+  if coalesce(st, '["Inspection Scheduled","Inspected","Claim Pending","Sold"]'::jsonb) ? new.status
+     or exists (select 1 from acx_map where workspace_id = new.workspace_id and lead_id = new.id and job_id is not null) then
+    insert into acx_queue(workspace_id, lead_id, next_at) values (new.workspace_id, new.id, now() + interval '30 seconds')
+      on conflict (workspace_id, lead_id) do update set next_at = greatest(acx_queue.next_at, now() + interval '30 seconds'), tries = 0;
+  end if;
+  return new;
+end $$;
+drop trigger if exists acx_on_lead on public.leads;
+create trigger acx_on_lead after insert or update on public.leads for each row execute function public._acx_on_lead();
+
+-- Office: connection status, settings and recent activity. Never the key.
+create or replace function public.acx_status(ws uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare c acx_conn;
+begin
+  if not public.can_view_all(ws) then raise exception 'not allowed'; end if;
+  select * into c from acx_conn where workspace_id = ws;
+  return jsonb_build_object(
+    'connected', c.workspace_id is not null, 'can_connect', public.is_manager(ws),
+    'status', c.status, 'company', c.company, 'connected_at', c.connected_at, 'connected_by', c.connected_by,
+    'last_sync_at', c.last_sync_at, 'last_error', c.last_error, 'settings', c.settings,
+    'sources', coalesce(c.lists->'sources', '[]'::jsonb),
+    'reps', coalesce((select jsonb_agg(jsonb_build_object('id', m.user_id, 'name', m.display_name,
+        'matched', exists (select 1 from jsonb_array_elements(coalesce(c.lists->'users','[]'::jsonb)) u where lower(u->>'email') = lower(au.email))))
+      from members m join auth.users au on au.id = m.user_id where m.workspace_id = ws and m.active and not m.support), '[]'::jsonb),
+    'sent', (select count(*) from acx_map x where x.workspace_id = ws and x.job_id is not null),
+    'waiting', (select count(*) from acx_queue q where q.workspace_id = ws),
+    'log', coalesce((select jsonb_agg(jsonb_build_object('at', l.at, 'ok', l.ok, 'msg', l.msg, 'lead', l.lead_id) order by l.at desc)
+                     from (select * from acx_log where workspace_id = ws order by at desc limit 15) l), '[]'::jsonb));
+end $$;
+
+-- Rep or office: is this lead in AccuLynx yet?
+create or replace function public.acx_lead(p_lead text) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare l leads; x acx_map;
+begin
+  select * into l from leads where id = p_lead;
+  if l.id is null or not public.is_member(l.workspace_id) or not public.can_see_lead(p_lead) then return null; end if;
+  if not exists (select 1 from acx_conn where workspace_id = l.workspace_id) then return null; end if;
+  select * into x from acx_map where workspace_id = l.workspace_id and lead_id = p_lead;
+  return jsonb_build_object('job', x.job_id is not null, 'number', x.job_number, 'at', x.created_at,
+    'waiting', exists (select 1 from acx_queue q where q.workspace_id = l.workspace_id and q.lead_id = p_lead));
+end $$;
+
+revoke execute on function public.acx_status(uuid), public.acx_lead(text) from public, anon;
+grant execute on function public.acx_status(uuid), public.acx_lead(text) to authenticated;
+revoke execute on function public._acx_on_lead() from public, anon, authenticated;
+
+-- Every minute: send waiting leads (only calls the function when something is due).
+-- Daily: drop activity older than 90 days.
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') and exists (select 1 from pg_extension where extname = 'pg_net') then
+    perform cron.schedule('ruva-acx-send', '* * * * *', $c$
+      select net.http_post(
+        url := 'https://fixqhaewtyddieoimmrv.supabase.co/functions/v1/acculynx',
+        headers := jsonb_build_object('Content-Type', 'application/json'),
+        body := jsonb_build_object('action', 'drain', 'token', (select cron_token from public.acx_cfg where id = 1)))
+      where exists (select 1 from public.acx_queue where next_at <= now());$c$);
+    perform cron.schedule('ruva-acx-purge', '50 7 * * *', $c$ delete from public.acx_log where at < now() - interval '90 days';$c$);
+  end if;
+exception when others then null; end $$;
