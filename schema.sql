@@ -2754,3 +2754,419 @@ drop trigger if exists qbo_state_plan on public.qbo_state;
 create trigger qbo_state_plan before insert on public.qbo_state for each row execute function public._qbo_plan_guard();
 drop trigger if exists qbo_conn_plan on public.qbo_conn;
 create trigger qbo_conn_plan before insert on public.qbo_conn for each row execute function public._qbo_plan_guard();
+
+-- 13. Security fixes from the November 18 code review.
+--  a. A company can switch to a one-person account (cheaper plan) only once the owner is the only member left,
+--     and nobody can join a one-person account with an invite code.
+--  b. Support staff can't remove their own "support" flag (so the owner's "turn off support access" always works).
+--  c. Only managers change a member's commission override (members.prefs); reps can't set their own.
+--  d. Chat photos can only be opened by people who can read the message they were sent in (so DM photos stay private).
+--  e. When the trial is over and nobody has paid, claiming, assigning, releasing and taking over leads and
+--     sending a homeowner link are blocked too (they skipped the read-only check before).
+--  f. The old feedback-viewer key was in this repo, so it is replaced with a random one nobody has.
+--     RUVA HQ shows feedback through the admin sign-in and doesn't use this key.
+-- Nothing here changes or deletes customer data.
+
+create or replace function public._need_active(ws uuid) returns void
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.ws_active(ws) then
+    raise exception 'RIDGEMATE_INACTIVE: This RUVA account needs a plan. The owner can choose one in Settings → Plan & billing.';
+  end if;
+end $$;
+revoke all on function public._need_active(uuid) from public;
+
+create or replace function public.workspaces_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  if new.owner_id is distinct from old.owner_id or new.id is distinct from old.id then
+    raise exception 'The account owner cannot be changed here';
+  end if;
+  new.trial_ends_at := old.trial_ends_at; new.sub_status := old.sub_status; new.billing_exempt := old.billing_exempt;
+  new.stripe_customer := old.stripe_customer; new.stripe_sub := old.stripe_sub; new.stripe_mode := old.stripe_mode;
+  new.seats := old.seats; new.period_end := old.period_end; new.cancel_at_period_end := old.cancel_at_period_end;
+  new.comp_until := old.comp_until; new.comp_code := old.comp_code;
+  -- A company can become a one-person account only once the owner is the only one left on it.
+  if new.kind is distinct from old.kind and new.kind = 'individual' and exists(
+       select 1 from members m where m.workspace_id = old.id and m.active and not m.support and m.user_id <> old.owner_id) then
+    raise exception 'Remove everyone else from the team first, then switch to a one-person account.';
+  end if;
+  return new;
+end $$;
+
+create or replace function public.members_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  if new.workspace_id is distinct from old.workspace_id or new.user_id is distinct from old.user_id then
+    raise exception 'Members cannot be moved';
+  end if;
+  if new.role is distinct from old.role or new.active is distinct from old.active then
+    if not public.is_manager(old.workspace_id) then raise exception 'Only managers can change roles'; end if;
+    if old.role = 'owner' or new.role = 'owner' then raise exception 'The account owner cannot be changed here'; end if;
+  end if;
+  if new.support is distinct from old.support then raise exception 'Support access is changed by the account owner'; end if;
+  if new.prefs is distinct from old.prefs and not public.is_manager(old.workspace_id) then
+    raise exception 'Only managers can change commission overrides';
+  end if;
+  return new;
+end $$;
+
+create or replace function public.join_workspace(p_code text, p_display_name text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare inv invites;
+begin
+  if auth.uid() is null then raise exception 'Sign in first'; end if;
+  select * into inv from invites where code = upper(trim(p_code)) for update;
+  if not found or inv.expires_at < now() or inv.uses >= inv.max_uses then raise exception 'That invite code is not valid'; end if;
+  if (select kind from workspaces where id = inv.workspace_id) <> 'company' then
+    raise exception 'This is a one-person account. The owner can switch it to a company account first.';
+  end if;
+  insert into members(workspace_id, user_id, role, display_name, phone)
+  values (inv.workspace_id, auth.uid(), inv.role, coalesce(nullif(trim(p_display_name),''), inv.name, ''), coalesce(inv.phone,''))
+  on conflict (workspace_id, user_id) do update
+    set role = case when members.active or members.role = 'owner' then members.role else excluded.role end,
+        active = true;
+  update invites set uses = uses + 1 where code = inv.code;
+  return inv.workspace_id;
+end $$;
+
+create or replace function public.claim_lead(lid text)
+returns text language plpgsql security definer set search_path = public as $$
+declare l leads; cap int; held int; hrs numeric;
+begin
+  select * into l from leads where id = lid for update;
+  if not found or not public.is_member(l.workspace_id) then raise exception 'Lead not found'; end if;
+  perform public._need_active(l.workspace_id);
+  if not l.pool or l.owner_id is not null then return 'taken'; end if;
+  select coalesce((settings->>'claim_cap')::int, 3), coalesce((settings->>'claim_deadline_hours')::numeric, 2)
+    into cap, hrs from workspaces where id = l.workspace_id;
+  select count(*) into held from leads
+   where workspace_id = l.workspace_id and owner_id = auth.uid() and origin = 'company' and contacted_at is null and claimed_at is not null;
+  if held >= cap then return 'cap'; end if;
+  update leads set owner_id = auth.uid(), pool = false, claimed_at = now(), status = 'Inspection Scheduled', updated_at = now(),
+         data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) ||
+                jsonb_build_array(jsonb_build_object('t', (extract(epoch from now())*1000)::bigint, 'r', 'Claimed', 'by', auth.uid())))
+   where id = lid;
+  return 'ok';
+end $$;
+
+create or replace function public.assign_lead(lid text, p_user uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare l leads;
+begin
+  select * into l from leads where id = lid for update;
+  if not found or not public.is_manager(l.workspace_id) then raise exception 'Not allowed'; end if;
+  perform public._need_active(l.workspace_id);
+  update leads set owner_id = p_user, pool = (p_user is null), claimed_at = case when p_user is null then null else now() end,
+         contacted_at = null, updated_at = now(),
+         data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) ||
+                jsonb_build_array(jsonb_build_object('t', (extract(epoch from now())*1000)::bigint,
+                  'r', case when p_user is null then 'Returned to board' else 'Assigned' end, 'by', auth.uid(), 'to', p_user)))
+   where id = lid;
+end $$;
+
+create or replace function public.release_lead(lid text, p_reason text)
+returns void language plpgsql security definer set search_path = public as $$
+declare l leads;
+begin
+  select * into l from leads where id = lid for update;
+  if not found or l.owner_id is distinct from auth.uid() then raise exception 'Not your lead'; end if;
+  perform public._need_active(l.workspace_id);
+  update leads set owner_id = null, pool = true, claimed_at = null, contacted_at = null, updated_at = now(),
+         data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) ||
+                jsonb_build_array(jsonb_build_object('t', (extract(epoch from now())*1000)::bigint, 'r', 'Released', 'by', auth.uid(), 'note', p_reason)))
+   where id = lid;
+end $$;
+
+create or replace function public.take_over_door(lid text)
+returns text language plpgsql security definer set search_path = public as $$
+declare l leads; days int;
+begin
+  select * into l from leads where id = lid for update;
+  if not found or not public.is_member(l.workspace_id) then raise exception 'Lead not found'; end if;
+  perform public._need_active(l.workspace_id);
+  if l.owner_id = auth.uid() then return 'mine'; end if;
+  -- Open Leads go through claim_lead; office leads a rep has claimed stay theirs (managers reassign them)
+  if l.pool or l.owner_id is null then return 'taken'; end if;
+  if l.origin = 'company' then return 'protected'; end if;
+  if l.protected_until is not null and l.protected_until > now() then return 'protected'; end if;
+  select coalesce((settings->>'protect_days')::int, 30) into days from workspaces where id = l.workspace_id;
+  update leads set owner_id = auth.uid(), protected_until = now() + make_interval(days => days), updated_at = now(),
+         data = jsonb_set(data, '{knocks}', coalesce(data->'knocks','[]'::jsonb) ||
+                jsonb_build_array(jsonb_build_object('t', (extract(epoch from now())*1000)::bigint, 'r', 'Taken over', 'by', auth.uid(), 'from', l.owner_id)))
+   where id = lid;
+  return 'ok';
+end $$;
+
+create or replace function public.ho_link(p_lead text, p_offer jsonb default null) returns text
+language plpgsql security definer set search_path = public as $$
+declare l leads; t text;
+begin
+  select * into l from leads where id = p_lead;
+  if l.id is null or not public.is_member(l.workspace_id) or not public.can_see_lead(p_lead) then raise exception 'not allowed'; end if;
+  perform public._need_active(l.workspace_id);
+  if (select plan from workspaces where id = l.workspace_id) = 'field' then raise exception 'The homeowner page comes with the full RUVA plan'; end if;
+  select token into t from ho_links where lead_id = p_lead and revoked_at is null;
+  if t is null then
+    t := replace(gen_random_uuid()::text, '-', '');
+    insert into ho_links(token, workspace_id, lead_id) values (t, l.workspace_id, p_lead)
+      on conflict (lead_id) do update set token = excluded.token, revoked_at = null, created_at = now(), created_by = auth.uid();
+  end if;
+  if p_offer is not null and jsonb_typeof(p_offer->'tiers') = 'array' then
+    update leads set data = jsonb_set(data, '{ho}', coalesce(data->'ho','{}'::jsonb) || jsonb_build_object('offer', p_offer, 'offerAt', (extract(epoch from now())*1000)::bigint)) where id = p_lead;
+  end if;
+  return t;
+end $$;
+
+create index if not exists messages_image_idx on public.messages(image_path) where image_path is not null;
+do $$ begin
+  if exists (select 1 from pg_namespace where nspname = 'storage') then
+    execute 'drop policy if exists photos_read on storage.objects';
+    execute $p$create policy photos_read on storage.objects for select to authenticated
+      using (bucket_id = 'photos' and public.is_member((split_part(name,'/',1))::uuid)
+             and case when split_part(name,'/',2) = 'chat'
+                      then owner = auth.uid() or exists(select 1 from public.messages m where m.image_path = storage.objects.name)
+                      else public.can_view_all((split_part(name,'/',1))::uuid) or public.can_see_lead(split_part(name,'/',2)) end)$p$;
+  end if;
+end $$;
+
+do $$ begin
+  if to_regclass('public.feedback_key') is not null then
+    execute $q$update public.feedback_key set k = encode(gen_random_bytes(24), 'hex')$q$;
+  end if;
+end $$;
+
+-- 14. Data-loss and security fixes from the November 18 code review (part 2).
+--  a. AccuLynx: one sender per lead at a time. The every-minute sender and "Send now" take a lease on a waiting
+--     lead (acx_claim), so overlapping runs can't send the same lead twice. A lead changed again while it is
+--     being sent now gets a new queued_at (so it stays in line), and an edit no longer resets the try count.
+--  b. Push notifications: a send that failed because the push service had trouble goes back in line
+--     (up to 3 more tries, a few minutes apart). The push function now only sends when the database wakes it
+--     with a secret token (kept in push_keys, like the QuickBooks and AccuLynx tokens).
+--  c. QuickBooks: room to hold a new sign-in until the person who started connecting confirms it.
+--  d. Homeowner page: on the Field plan the homeowner can't pick or sign (the page still shows). Picking the
+--     same option again does nothing, and the office gets at most one "Homeowner picked" alert a minute per job.
+--     Once the office marks the contract ready the homeowner's pick is locked (the page says to call or text the rep,
+--     with the rep's number); the office can reopen it (data.ho.pickOpen), and a new pick locks it again.
+-- Safe to run more than once. Nothing here changes or deletes customer data.
+
+-- a. AccuLynx queue lease -----------------------------------------------------------------------------
+alter table public.acx_queue add column if not exists leased_until timestamptz;
+
+create or replace function public.acx_claim(p_limit int default 60, p_lease_sec int default 300, p_ws uuid default null, p_lead text default null)
+returns table(workspace_id uuid, lead_id text, tries int, queued_at timestamptz)
+language plpgsql security definer set search_path = public as $$
+#variable_conflict use_column
+declare lease interval := make_interval(secs => greatest(30, least(coalesce(p_lease_sec, 300), 3600)));
+begin
+  -- due rows (or the one lead "Send now" asked for) that nobody else holds right now
+  return query
+    update acx_queue q set leased_until = now() + lease, next_at = greatest(q.next_at, now() + lease)
+     where (q.workspace_id, q.lead_id) in (
+       select x.workspace_id, x.lead_id from acx_queue x
+        where (x.leased_until is null or x.leased_until <= now())
+          and (case when p_lead is null then x.next_at <= now() else x.lead_id = p_lead end)
+          and (p_ws is null or x.workspace_id = p_ws)
+        order by x.next_at
+        limit greatest(1, least(coalesce(p_limit, 60), 200))
+        for update skip locked)
+    returning q.workspace_id, q.lead_id, q.tries, q.queued_at;
+end $$;
+revoke execute on function public.acx_claim(int, int, uuid, text) from public, anon, authenticated;
+do $$ begin execute 'grant execute on function public.acx_claim(int, int, uuid, text) to service_role'; exception when others then null; end $$;
+
+create or replace function public._acx_on_lead() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare st jsonb;
+begin
+  select settings->'statuses' into st from acx_conn where workspace_id = new.workspace_id and status = 'connected';
+  if not found then return new; end if;
+  if tg_op = 'UPDATE' and new.status is not distinct from old.status and new.data is not distinct from old.data
+     and new.name is not distinct from old.name and new.phone is not distinct from old.phone then return new; end if;
+  if coalesce(st, '["Inspection Scheduled","Inspected","Claim Pending","Sold"]'::jsonb) ? new.status
+     or exists (select 1 from acx_map where workspace_id = new.workspace_id and lead_id = new.id and job_id is not null) then
+    insert into acx_queue(workspace_id, lead_id, next_at) values (new.workspace_id, new.id, now() + interval '30 seconds')
+      on conflict (workspace_id, lead_id) do update set next_at = greatest(acx_queue.next_at, now() + interval '30 seconds'), queued_at = clock_timestamp();
+  end if;
+  return new;
+end $$;
+revoke execute on function public._acx_on_lead() from public, anon, authenticated;
+
+-- b. Push: retries and a wake-up token ---------------------------------------------------------------
+alter table public.push_outbox add column if not exists tries int not null default 0;
+alter table public.push_outbox add column if not exists next_at timestamptz;
+alter table public.push_keys add column if not exists cron_token text not null default encode(gen_random_bytes(32), 'hex');
+
+create or replace function public._push_wake() returns void
+language plpgsql security definer set search_path = public as $$
+declare k push_keys;
+begin
+  select * into k from push_keys where id = 1;
+  if coalesce(k.fn_url,'') = '' then return; end if;
+  begin
+    perform net.http_post(url := k.fn_url, body := jsonb_build_object('token', k.cron_token), headers := '{"Content-Type":"application/json"}'::jsonb);
+  exception when others then null;
+  end;
+end $$;
+
+create or replace function public.push_retry() returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if exists (select 1 from push_outbox where sent_at is null and created_at > now() - interval '1 day' and (next_at is null or next_at <= now())) then
+    perform public._push_wake();
+  end if;
+end $$;
+
+create or replace function public.push_init(p_public text, p_private jsonb, p_url text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k push_keys;
+begin
+  select * into k from push_keys where id = 1;
+  if not found then
+    if p_public is null then raise exception 'no keys'; end if;
+    insert into push_keys(id, public_key, private_jwk, fn_url) values (1, p_public, p_private, coalesce(p_url,''))
+    on conflict (id) do nothing;
+    select * into k from push_keys where id = 1;
+  end if;
+  if coalesce(p_url,'') <> '' and k.fn_url is distinct from p_url then
+    update push_keys set fn_url = p_url where id = 1 returning * into k;
+  end if;
+  return jsonb_build_object('public_key', k.public_key, 'private_jwk', k.private_jwk, 'fn_url', k.fn_url, 'cron_token', k.cron_token);
+end $$;
+
+create or replace function public.push_claim(p_limit int default 200) returns setof public.push_outbox
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from push_outbox where created_at < now() - interval '7 days';
+  return query
+    update push_outbox o set sent_at = now()
+     where o.id in (select id from push_outbox where sent_at is null and created_at > now() - interval '1 day'
+                     and (next_at is null or next_at <= now())
+                     order by id limit greatest(1, least(coalesce(p_limit,200), 500)) for update skip locked)
+    returning o.*;
+end $$;
+
+-- A message no device got because the push service had trouble: try again in 2, 4, then 6 minutes, then give up.
+create or replace function public.push_fail(p_ids bigint[]) returns int
+language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  update push_outbox set sent_at = null, tries = tries + 1, next_at = now() + make_interval(mins => 2 * (tries + 1))
+   where id = any(coalesce(p_ids, '{}'::bigint[])) and sent_at is not null and tries < 3;
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+revoke execute on function public._push_wake() from public, anon, authenticated;
+revoke execute on function public.push_retry() from public, anon, authenticated;
+revoke execute on function public.push_init(text, jsonb, text) from public, anon, authenticated;
+revoke execute on function public.push_claim(int) from public, anon, authenticated;
+revoke execute on function public.push_fail(bigint[]) from public, anon, authenticated;
+do $$ begin
+  execute 'grant execute on function public.push_init(text, jsonb, text), public.push_claim(int), public.push_fail(bigint[]) to service_role';
+exception when others then null; end $$;
+
+-- c. QuickBooks: a sign-in waiting for the person who started it (encrypted by the qbo function) -------
+alter table public.qbo_state add column if not exists pending text;
+
+-- d. Homeowner page ----------------------------------------------------------------------------------
+create or replace function public.ho_pick(p_token text, p_i int) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k ho_links; l leads; t jsonb; sq numeric; ln jsonb; who uuid[];
+begin
+  select * into k from ho_links where token = p_token and revoked_at is null;
+  if k.token is null then raise exception 'link not found'; end if;
+  select * into l from leads where id = k.lead_id for update;
+  if (select plan from workspaces where id = l.workspace_id) = 'field' then raise exception 'The homeowner page comes with the full RUVA plan'; end if;
+  if coalesce(l.data->'est'->>'sigAt','') <> '' then raise exception 'already signed'; end if;
+  -- once the office marks the contract ready, the pick is locked until the office reopens it
+  if coalesce(l.data->'sale'->'er'->>'st','') = 'ready' and l.data->'est'->'pick' is not null
+     and not coalesce((l.data->'ho'->>'pickOpen')::boolean, false) then raise exception 'pick locked'; end if;
+  t := l.data->'ho'->'offer'->'tiers'->p_i;
+  if t is null then raise exception 'no such option'; end if;
+  sq := coalesce(nullif(l.data->'ho'->'offer'->>'sq','')::numeric, 0);
+  ln := jsonb_build_object('d', 'Tear off and replace · ' || coalesce(t->>'name','') || ' (' || (t->>'n') || ')', 'q', sq::text, 'u', 'SQ', 'p', t->>'per', 'tier', 1);
+  -- the same option again, with the same price: nothing to change, nobody to tell
+  if l.data->'est'->'pick' = to_jsonb(p_i)
+     and exists (select 1 from jsonb_array_elements(coalesce(l.data->'est'->'lines','[]'::jsonb)) x where x = ln) then
+    return public.ho_view(p_token);
+  end if;
+  update leads set data = jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
+      '{ho}', coalesce(data->'ho','{}'::jsonb) - 'pickOpen'),
+      '{est,lines}', jsonb_build_array(ln) || coalesce((select jsonb_agg(x) from jsonb_array_elements(coalesce(data->'est'->'lines','[]'::jsonb)) x where coalesce((x->>'tier')::int,0) <> 1), '[]'::jsonb)),
+      '{est,pick}', to_jsonb(p_i)),
+      '{log}', coalesce(data->'log','[]'::jsonb) || jsonb_build_array(jsonb_build_object('t', (extract(epoch from now())*1000)::bigint, 'text', 'Homeowner picked ' || (t->>'n') || ' from their link · $' || to_char(sq * (t->>'per')::numeric, 'FM999,999,990'))))
+    where id = l.id;
+  -- at most one alert a minute per job, so clicking back and forth doesn't buzz the office every time
+  if not exists (select 1 from push_outbox where tag = 'ho:' || l.id and created_at > now() - interval '1 minute') then
+    who := array(select user_id from members where workspace_id = l.workspace_id and active and not support and (role in ('owner','manager','office') or user_id = l.owner_id));
+    perform public._push(who, 'jobs', 'Homeowner picked ' || (t->>'n'), public._push_addr(l) || ' · $' || to_char(sq * (t->>'per')::numeric, 'FM999,999,990'), './?lead=' || l.id || '#leads', 'ho:' || l.id);
+  end if;
+  return public.ho_view(p_token);
+end $$;
+
+create or replace function public.ho_sign(p_token text, p_name text, p_img text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare k ho_links; l leads; now_ms bigint := (extract(epoch from now())*1000)::bigint;
+begin
+  select * into k from ho_links where token = p_token and revoked_at is null;
+  if k.token is null then raise exception 'link not found'; end if;
+  select * into l from leads where id = k.lead_id for update;
+  if (select plan from workspaces where id = l.workspace_id) = 'field' then raise exception 'The homeowner page comes with the full RUVA plan'; end if;
+  if coalesce(l.data->'sale'->'er'->>'st','') <> 'ready' then raise exception 'contract not ready'; end if;
+  if coalesce(l.data->'est'->>'sigAt','') <> '' then raise exception 'already signed'; end if;
+  if length(trim(coalesce(p_name,''))) < 2 then raise exception 'name required'; end if;
+  if p_img is null or p_img not like 'data:image/png;base64,%' or length(p_img) > 300000 then raise exception 'bad signature'; end if;
+  update leads set data = jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
+      '{est,hoSig}', jsonb_build_object('img', p_img, 'name', trim(p_name), 'at', now_ms)),
+      '{est,sigName}', to_jsonb(trim(p_name))),
+      '{est,sigAt}', to_jsonb(to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+      '{log}', coalesce(data->'log','[]'::jsonb) || jsonb_build_array(jsonb_build_object('t', now_ms, 'text', 'Homeowner signed the contract from their link')))
+    where id = l.id;
+  return public.ho_view(p_token);
+end $$;
+
+-- The homeowner page gets pick_locked and the rep's phone (based on the live ho_view, Nov 18).
+create or replace function public.ho_view(p_token text) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare k ho_links; l leads; w workspaces; e jsonb; tot numeric := 0; rep text; pid text; roof text; rph text;
+begin
+  select * into k from ho_links where token = p_token and length(p_token) >= 24 and revoked_at is null;
+  if k.token is null then return null; end if;
+  select * into l from leads where id = k.lead_id;
+  if l.id is null then return null; end if;
+  select * into w from workspaces where id = l.workspace_id;
+  e := coalesce(l.data->'est', '{}'::jsonb);
+  select coalesce(sum(coalesce(nullif(regexp_replace(x->>'q','[^0-9.]','','g'),'')::numeric,0) * coalesce(nullif(regexp_replace(x->>'p','[^0-9.-]','','g'),'')::numeric,0)),0)
+    into tot from jsonb_array_elements(coalesce(e->'lines','[]'::jsonb)) x;
+  rep := case when l.owner_id is not null then split_part(public._push_name(l.workspace_id, l.owner_id), ' ', 1) end;
+  if l.owner_id is not null then select nullif(trim(phone),'') into rph from members where workspace_id = l.workspace_id and user_id = l.owner_id and active; end if;
+  pid := e->'sys'->>'pid';
+  if pid is not null then
+    select trim(concat_ws(' ', nullif(nullif(c->>'brand',''),'Any'), c->>'name')) into roof from jsonb_array_elements(coalesce(w.settings->'catalog','[]'::jsonb)) c where c->>'id' = pid limit 1;
+    if roof is null then roof := case pid when 'a1' then 'Atlas Pinnacle Pristine' end; end if;
+  end if;
+  if roof is not null and coalesce(e->'sys'->>'color', e->>'color', '') <> '' then roof := roof || ' · ' || coalesce(nullif(e->'sys'->>'color',''), e->>'color'); end if;
+  return jsonb_build_object(
+    'company', jsonb_build_object('name', w.name, 'phone', w.settings->'profile'->>'phone', 'logo', w.settings->'profile'->>'logo', 'license', w.settings->'profile'->>'license'),
+    'rep', rep, 'rep_phone', rph,
+    'name', l.name, 'address', trim(concat_ws(' ', l.num, l.street)), 'city', l.city,
+    'type', coalesce(l.data->'sale'->>'type', 'Insurance'),
+    'status', l.status, 'stage', l.data->'sale'->>'stage',
+    'install', l.data->'sale'->'install'->>'at',
+    'offer', l.data->'ho'->'offer',
+    'pick', e->'pick',
+    'pick_locked', coalesce(l.data->'sale'->'er'->>'st','') = 'ready' and e->'pick' is not null and not coalesce((l.data->'ho'->>'pickOpen')::boolean, false),
+    'roof', roof,
+    'contract', case when (coalesce(l.data->'sale'->'er'->>'st','') = 'ready' or coalesce(e->>'sigAt','') <> '') and tot > 0 then jsonb_build_object(
+        'total', round(tot, 2),
+        'lines', (select jsonb_agg(x->>'d') from jsonb_array_elements(coalesce(e->'lines','[]'::jsonb)) x where coalesce(x->>'d','') <> ''),
+        'terms', w.settings->>'terms') end,
+    'signed', case when coalesce(e->>'sigAt','') <> '' then jsonb_build_object('name', e->>'sigName', 'at', e->>'sigAt') end
+  );
+end $$;
+
+revoke execute on function public.ho_pick(text, int), public.ho_sign(text, text, text), public.ho_view(text) from public;
+grant execute on function public.ho_pick(text, int), public.ho_sign(text, text, text), public.ho_view(text) to anon, authenticated;
