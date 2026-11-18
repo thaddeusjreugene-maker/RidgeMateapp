@@ -3682,3 +3682,115 @@ exception when others then null; end $$;
 alter function public.email_defaults() set search_path = public;
 alter function public._email_stage(public.leads) set search_path = public;
 alter function public._email_ms(text) set search_path = public;
+
+-- RUVA migration 17: Completed jobs (Nov 18, 2026). Safe to run more than once.
+-- No new tables or columns, and no existing lead data changes. Two function updates:
+--
+-- 1. leads_guard: only an owner or a manager can mark a job completed or move it back.
+--    A completed job is a Sold lead with data.closed set (a time), and data.closedBy (who did it).
+--    If anyone else's save would change those two keys, the old values are kept; the rest of
+--    the save goes through as before.
+--
+-- 2. _email_steps: past-customer emails (review +7 days, referral +30, yearly) count from the
+--    day the job was marked completed, on both plans. Jobs never marked completed keep the
+--    old rule (Full: the install date once built; Field: the Sold date with the Field days).
+--    Moving a job back to active puts it back on the old rule, so unsent steps follow.
+
+create or replace function public.leads_guard() returns trigger
+language plpgsql set search_path = public as $$
+declare k text;
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  -- Reports the owner, a manager or the office attached can only be removed by them, not by the rep
+  if not public.can_view_all(old.workspace_id) and exists (
+       select 1 from jsonb_array_elements(case when jsonb_typeof(old.data->'docs') = 'array' then old.data->'docs' else '[]'::jsonb end) d
+       where coalesce(d->>'staff','') = 'true'
+         and not (case when jsonb_typeof(new.data->'docs') = 'array' then new.data->'docs' else '[]'::jsonb end) @> jsonb_build_array(jsonb_build_object('id', d->'id'))) then
+    raise exception 'Only the office can remove a report it attached';
+  end if;
+  -- Job completed: owners and managers only. Anyone else's change to these keys is quietly undone.
+  if not public.is_manager(old.workspace_id) then
+    foreach k in array array['closed','closedBy'] loop
+      if (old.data -> k) is distinct from (new.data -> k) then
+        if old.data ? k then new.data := new.data || jsonb_build_object(k, old.data -> k);
+        else new.data := new.data - k; end if;
+      end if;
+    end loop;
+  end if;
+  if public.is_manager(old.workspace_id) and public.is_manager(new.workspace_id) then return new; end if;
+  if new.workspace_id is distinct from old.workspace_id or new.owner_id is distinct from old.owner_id
+     or new.created_by is distinct from old.created_by or new.origin is distinct from old.origin
+     or new.pool is distinct from old.pool or new.posted_by is distinct from old.posted_by
+     or new.posted_at is distinct from old.posted_at or new.claimed_at is distinct from old.claimed_at then
+    raise exception 'Only a manager can change who owns a lead or its board status';
+  end if;
+  if new.protected_until is distinct from old.protected_until and new.protected_until is not null then
+    new.protected_until := least(new.protected_until, public._protect_cap(new.workspace_id));
+  end if;
+  return new;
+end $$;
+
+-- Keep closedBy safe from older phone apps too, the same way closed already is.
+create or replace function public._keep_office_keys() returns trigger
+language plpgsql as $$
+declare k text;
+begin
+  foreach k in array array['tasks','emails','gdocs','jobNo','closed','closedBy','branch','fired'] loop
+    if (old.data ? k) and not (new.data ? k) then
+      new.data := new.data || jsonb_build_object(k, old.data -> k);
+    end if;
+  end loop;
+  return new;
+end $$;
+
+create or replace function public._email_steps(l public.leads, plan text, fdays jsonb)
+returns table(campaign text, step text, due timestamptz)
+language plpgsql stable set search_path = public as $$
+declare st text := _email_stage(l); t text := coalesce(nullif(l.data->>'temp',''),'warm');
+  t_at timestamptz := _email_ms(l.data->>'tempAt'); insp timestamptz; a timestamptz; n int;
+  done timestamptz := _email_ms(l.data->>'closed');
+begin
+  if st in ('N','I') then
+    if t = 'hot' or l.owner_id is null or l.pool then return; end if;
+    if t = 'cold' then
+      a := coalesce(t_at, l.updated_at);
+      for n in 1..36 loop campaign := 'cold_checkin'; step := 'm' || n || '@' || to_char(a, 'YYYY-MM-DD'); due := a + make_interval(months => n); return next; end loop;
+      return;
+    end if;
+    if st = 'I' then
+      select max(_email_ms(k->>'t')) into insp from jsonb_array_elements(coalesce(l.data->'knocks','[]'::jsonb)) k
+        where k->>'r' in ('Inspected','Claim Pending');
+      a := greatest(coalesce(insp, l.created_at), coalesce(t_at, '-infinity'::timestamptz));
+      campaign := 'inspected_no_answer';
+      step := 'd3';  due := a + interval '3 days';  return next;
+      step := 'd7';  due := a + interval '7 days';  return next;
+      step := 'd14'; due := a + interval '14 days'; return next;
+    elsif l.status <> 'Inspection Scheduled' then
+      a := greatest(l.created_at, coalesce(t_at, '-infinity'::timestamptz));
+      campaign := 'not_inspected';
+      step := 'd2'; due := a + interval '2 days'; return next;
+      step := 'd7'; due := a + interval '7 days'; return next;
+    end if;
+  elsif st = 'S' then
+    if done is not null and done <= now() then
+      -- Marked completed (either plan): count from that day.
+      a := done;
+      campaign := 'pc_review';   step := 'r'; due := a + interval '7 days';  return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + interval '30 days'; return next;
+    elsif plan = 'field' then
+      a := _email_ms(l.data->'sale'->>'soldAt');
+      if a is null then return; end if;
+      campaign := 'pc_review';   step := 'r'; due := a + make_interval(days => coalesce((fdays->>'review')::int, 30));   return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + make_interval(days => coalesce((fdays->>'referral')::int, 60)); return next;
+    else
+      -- Full: count from the install date once the job is built (Installed, Final check paid or invoiced).
+      if not (coalesce(l.data->'sale'->>'stage','') in ('Installed','Final check paid') or coalesce(l.data->'sale'->'inv'->>'sentAt','') <> '') then return; end if;
+      a := _email_ms(l.data->'sale'->'install'->>'at');
+      if a is null or a > now() then return; end if;
+      campaign := 'pc_review';   step := 'r'; due := a + interval '7 days';  return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + interval '30 days'; return next;
+    end if;
+    for n in 1..10 loop campaign := 'pc_yearly'; step := 'y' || n; due := a + make_interval(years => n); return next; end loop;
+  end if;
+end $$;
+alter function public._email_steps(public.leads, text, jsonb) set search_path = public;
