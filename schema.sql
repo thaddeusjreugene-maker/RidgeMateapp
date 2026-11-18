@@ -3348,3 +3348,337 @@ begin
   return to_jsonb(r);
 end $$;
 revoke execute on function public.billing_cfg_set(text, jsonb) from public, anon, authenticated;
+
+-- =====================================================================
+-- 16. Email campaigns. Follow-ups to leads (by temperature), past-customer emails, unsubscribes.
+-- Both plans (Full and Field). Nothing sends until a company turns a campaign on, and nothing reaches a
+-- homeowner until the "email" Edge Function's EMAIL_LIVE secret is set. No existing table changes:
+-- temperature, "pause emails" and the Keep Warm snooze live in leads.data (temp, tempAt, emailsPaused).
+
+create table if not exists public.email_settings (
+  workspace_id     uuid primary key references public.workspaces(id) on delete cascade,
+  enabled          boolean not null default false,
+  from_name        text not null default '',
+  from_local       text not null default 'team',
+  office_reply_to  text not null default '',
+  mailing_address  text not null default '',
+  review_url       text not null default '',
+  timezone         text not null default 'America/New_York',
+  domain           text not null default '',
+  domain_status    text not null default 'none' check (domain_status in ('none','pending','verified','failed')),
+  provider_domain_id text not null default '',
+  dns              jsonb not null default '[]'::jsonb,
+  campaigns        jsonb not null default '{}'::jsonb,   -- {inspected_no_answer:true, ...}
+  field_days       jsonb not null default '{"review":30,"referral":60}'::jsonb,
+  test_to          text not null default '',              -- while EMAIL_LIVE is off, everything goes here
+  updated_by       uuid,
+  updated_at       timestamptz not null default now()
+);
+
+create table if not exists public.email_templates (
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  campaign     text not null,
+  step         text not null,
+  subject      text not null,
+  body         text not null,
+  updated_at   timestamptz not null default now(),
+  primary key (workspace_id, campaign, step)
+);
+
+create table if not exists public.email_sends (
+  id           bigserial primary key,
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id      text not null,
+  campaign     text not null,
+  step         text not null,
+  to_email     text not null,
+  status       text not null default 'queued' check (status in ('queued','sending','sent','failed','bounced','complained','skipped')),
+  claimed_at   timestamptz,
+  provider_id  text,
+  error        text not null default '',
+  test         boolean not null default false,
+  created_at   timestamptz not null default now(),
+  sent_at      timestamptz,
+  unique (workspace_id, lead_id, campaign, step)
+);
+create index if not exists email_sends_ws on public.email_sends(workspace_id, created_at desc);
+create index if not exists email_sends_queued on public.email_sends(created_at) where status = 'queued';
+create index if not exists email_sends_provider on public.email_sends(provider_id) where provider_id is not null;
+
+create table if not exists public.email_unsubs (
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  email        text not null,
+  reason       text not null default 'unsubscribed' check (reason in ('unsubscribed','bounced','complained')),
+  created_at   timestamptz not null default now(),
+  primary key (workspace_id, email)
+);
+
+create table if not exists public.email_cfg (id int primary key default 1 check (id = 1), cron_token text not null, daily_cap int not null default 100);
+insert into public.email_cfg(id, cron_token) values (1, encode(gen_random_bytes(32), 'hex')) on conflict (id) do nothing;
+
+alter table public.email_settings  enable row level security;
+alter table public.email_templates enable row level security;
+alter table public.email_sends     enable row level security;
+alter table public.email_unsubs    enable row level security;
+alter table public.email_cfg       enable row level security;
+revoke all on public.email_settings, public.email_templates, public.email_sends, public.email_unsubs, public.email_cfg from anon, authenticated;
+do $$ begin
+  execute 'grant all on public.email_settings, public.email_templates, public.email_sends, public.email_unsubs, public.email_cfg to service_role';
+  execute 'grant usage, select on sequence public.email_sends_id_seq to service_role';
+exception when others then null; end $$;
+
+-- Default wording. A company's own edits (email_templates) win.
+create or replace function public.email_defaults() returns jsonb language sql immutable as $$
+select '{
+ "inspected_no_answer": {
+  "d3":  {"subject":"Your roof inspection at {address}","body":"Hi {first_name}, it''s {rep_name} with {company}. Thanks again for letting me look at your roof. If you have any questions about what I found or the estimate, just reply here or call me at {rep_phone}."},
+  "d7":  {"subject":"Checking in on your roof","body":"Hi {first_name}, I wanted to check back in. Small roof problems usually get bigger, and it''s easier to deal with them now. I''m glad to walk through the estimate with you, no pressure. {rep_phone}"},
+  "d14": {"subject":"Last note from me","body":"Hi {first_name}, this is my last follow-up so I don''t crowd your inbox. If you ever want to pick this back up, reply here and I''ll take care of you.\n\n{rep_name}, {company}"}},
+ "not_inspected": {
+  "d2":  {"subject":"Free roof inspection","body":"Hi {first_name}, it''s {rep_name} with {company}. I can come out and inspect your roof for free. It takes about 30 minutes, and you''ll get photos of everything I see. Reply with a day that works, or call {rep_phone}."},
+  "d7":  {"subject":"Still want that roof check?","body":"Hi {first_name}, just following up. If now isn''t a good time, no problem. If you''d like the inspection, reply and I''ll get you on the schedule.\n\n{rep_name}"}},
+ "cold_checkin": {
+  "m":   {"subject":"Still here if you need us","body":"Hi {first_name}, it''s {rep_name} with {company}. Just checking in. If your roof took a hit or you''re ready to talk about it, reply here or call {rep_phone}."}},
+ "pc_review": {
+  "r":   {"subject":"How did we do?","body":"Hi {first_name}, thanks for trusting {company} with your roof. If we did right by you, a quick review helps us a lot: {review_url}\n\nIf anything isn''t right, reply here and we''ll fix it."}},
+ "pc_referral": {
+  "f":   {"subject":"Know someone who needs a roof?","body":"Hi {first_name}, our best work comes from neighbors telling neighbors. If you know someone with roof damage or an old roof, reply with their name or pass along our number. We''ll treat them the way we treated you."}},
+ "pc_yearly": {
+  "y":   {"subject":"Your yearly roof check","body":"Hi {first_name}, it''s been a year since we put the roof on at {address}. We''ll come check it over for free. Reply and we''ll set up a time."}}
+}'::jsonb $$;
+
+-- Where a lead sits: door, lost, N (new), I (inspected), S (sold) — same rules as the app's pstage().
+create or replace function public._email_stage(l public.leads) returns text language sql immutable as $$
+  select case
+    when coalesce(l.status,'') in ('','Not Home','Not Interested') then 'door'
+    when l.status in ('No Damage','Finance Denied','Cancelled') then 'lost'
+    when l.status = 'Sold' then 'S'
+    when l.status in ('Inspected','Claim Pending') or jsonb_array_length(coalesce(l.data->'est'->'lines','[]'::jsonb)) > 0 then 'I'
+    else 'N' end $$;
+
+create or replace function public._email_ms(v text) returns timestamptz language sql immutable as $$
+  select case when v ~ '^\d{10,14}$' then to_timestamp(v::numeric / 1000)
+              when v ~ '^\d{4}-\d{2}-\d{2}' then (left(v, 10))::date::timestamptz
+              else null end $$;
+
+-- Every step a lead could get, with when it's due. Sent steps are filtered by the callers.
+create or replace function public._email_steps(l public.leads, plan text, fdays jsonb)
+returns table(campaign text, step text, due timestamptz)
+language plpgsql stable set search_path = public as $$
+declare st text := _email_stage(l); t text := coalesce(nullif(l.data->>'temp',''),'warm');
+  t_at timestamptz := _email_ms(l.data->>'tempAt'); insp timestamptz; a timestamptz; n int;
+begin
+  if st in ('N','I') then
+    if t = 'hot' or l.owner_id is null or l.pool then return; end if;
+    if t = 'cold' then
+      a := coalesce(t_at, l.updated_at);
+      for n in 1..36 loop campaign := 'cold_checkin'; step := 'm' || n || '@' || to_char(a, 'YYYY-MM-DD'); due := a + make_interval(months => n); return next; end loop;
+      return;
+    end if;
+    if st = 'I' then
+      select max(_email_ms(k->>'t')) into insp from jsonb_array_elements(coalesce(l.data->'knocks','[]'::jsonb)) k
+        where k->>'r' in ('Inspected','Claim Pending');
+      a := greatest(coalesce(insp, l.created_at), coalesce(t_at, '-infinity'::timestamptz));
+      campaign := 'inspected_no_answer';
+      step := 'd3';  due := a + interval '3 days';  return next;
+      step := 'd7';  due := a + interval '7 days';  return next;
+      step := 'd14'; due := a + interval '14 days'; return next;
+    elsif l.status <> 'Inspection Scheduled' then
+      a := greatest(l.created_at, coalesce(t_at, '-infinity'::timestamptz));
+      campaign := 'not_inspected';
+      step := 'd2'; due := a + interval '2 days'; return next;
+      step := 'd7'; due := a + interval '7 days'; return next;
+    end if;
+  elsif st = 'S' then
+    if plan = 'field' then
+      a := _email_ms(l.data->'sale'->>'soldAt');
+      if a is null then return; end if;
+      campaign := 'pc_review';   step := 'r'; due := a + make_interval(days => coalesce((fdays->>'review')::int, 30));   return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + make_interval(days => coalesce((fdays->>'referral')::int, 60)); return next;
+    else
+      -- Full: count from the install date once the job is built (Installed, Final check paid or invoiced).
+      if not (coalesce(l.data->'sale'->>'stage','') in ('Installed','Final check paid') or coalesce(l.data->'sale'->'inv'->>'sentAt','') <> '') then return; end if;
+      a := _email_ms(l.data->'sale'->'install'->>'at');
+      if a is null or a > now() then return; end if;
+      campaign := 'pc_review';   step := 'r'; due := a + interval '7 days';  return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + interval '30 days'; return next;
+    end if;
+    for n in 1..10 loop campaign := 'pc_yearly'; step := 'y' || n; due := a + make_interval(years => n); return next; end loop;
+  end if;
+end $$;
+
+-- Who's due right now. Called every 15 minutes. Only steps that came due in the last 2 days, so turning a
+-- campaign on never sends a pile of old emails. Mon–Sat, 9am–6pm in the company's time zone.
+create or replace function public.email_enqueue() returns int
+language plpgsql security definer set search_path = public as $$
+declare cap int; used int; added int := 0; r record;
+begin
+  select daily_cap into cap from email_cfg where id = 1;
+  select count(*) into used from email_sends where created_at > now() - interval '1 day' and status in ('queued','sending','sent');
+  if used >= coalesce(cap, 100) then return 0; end if;
+  for r in
+    select l.workspace_id, l.id, lower(trim(l.data->>'email')) as em, x.campaign, x.step, x.due
+    from email_settings s
+    join workspaces w on w.id = s.workspace_id
+    join leads l on l.workspace_id = s.workspace_id
+    cross join lateral _email_steps(l, w.plan, s.field_days) x
+    where s.enabled
+      and extract(isodow from now() at time zone s.timezone) between 1 and 6
+      and extract(hour from now() at time zone s.timezone) between 9 and 17
+      and coalesce(s.campaigns->>x.campaign, 'false') = 'true'
+      and coalesce(l.data->>'emailsPaused', 'false') <> 'true'
+      and coalesce(l.data->>'email', '') ~* '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+      and x.due <= now() and x.due > now() - interval '2 days'
+      and not exists (select 1 from email_unsubs u where u.workspace_id = l.workspace_id and u.email = lower(trim(l.data->>'email')))
+      and not exists (select 1 from email_sends e where e.workspace_id = l.workspace_id and e.lead_id = l.id and e.campaign = x.campaign and e.step = x.step)
+      -- one email per lead per day at most
+      and not exists (select 1 from email_sends e where e.workspace_id = l.workspace_id and e.lead_id = l.id and e.created_at > now() - interval '20 hours' and e.status <> 'skipped')
+    order by x.due
+  loop
+    exit when used + added >= coalesce(cap, 100);
+    insert into email_sends(workspace_id, lead_id, campaign, step, to_email)
+      values (r.workspace_id, r.id, r.campaign, r.step, r.em) on conflict do nothing;
+    if found then added := added + 1; end if;
+  end loop;
+  return added;
+end $$;
+
+-- Office (owner/manager): settings, templates, counts and recent sends.
+create or replace function public.email_status(ws uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare s email_settings;
+begin
+  if not public.can_view_all(ws) then raise exception 'not allowed'; end if;
+  select * into s from email_settings where workspace_id = ws;
+  return jsonb_build_object(
+    'can_edit', public.is_manager(ws),
+    'plan', (select plan from workspaces where id = ws),
+    'company', (select name from workspaces where id = ws),
+    'settings', case when s.workspace_id is null then jsonb_build_object('enabled', false, 'from_local', 'team', 'timezone', 'America/New_York',
+                     'domain_status', 'none', 'campaigns', '{}'::jsonb, 'field_days', '{"review":30,"referral":60}'::jsonb, 'dns', '[]'::jsonb)
+                else to_jsonb(s) - 'workspace_id' - 'provider_domain_id' - 'updated_by' end,
+    'defaults', email_defaults(),
+    'templates', coalesce((select jsonb_object_agg(t.campaign || '.' || t.step, jsonb_build_object('subject', t.subject, 'body', t.body))
+                           from email_templates t where t.workspace_id = ws), '{}'::jsonb),
+    'sent_30d', (select count(*) from email_sends e where e.workspace_id = ws and e.status = 'sent' and e.sent_at > now() - interval '30 days'),
+    'unsubs', (select count(*) from email_unsubs u where u.workspace_id = ws),
+    'log', coalesce((select jsonb_agg(jsonb_build_object('at', coalesce(e.sent_at, e.created_at), 'lead', e.lead_id, 'name', l.name,
+                       'campaign', e.campaign, 'step', e.step, 'to', e.to_email, 'status', e.status, 'error', e.error, 'test', e.test) order by e.created_at desc)
+                     from (select * from email_sends where workspace_id = ws order by created_at desc limit 100) e
+                     left join leads l on l.id = e.lead_id), '[]'::jsonb));
+end $$;
+
+-- Owner/manager: save settings. Turning email on needs a mailing address (the law requires it in every email).
+create or replace function public.email_save(ws uuid, p jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+declare s email_settings; okc text[] := array['inspected_no_answer','not_inspected','cold_checkin','pc_review','pc_referral','pc_yearly'];
+  c jsonb := '{}'::jsonb; k text;
+begin
+  if not public.is_manager(ws) then raise exception 'Only an owner or manager can change email settings'; end if;
+  insert into email_settings(workspace_id) values (ws) on conflict do nothing;
+  select * into s from email_settings where workspace_id = ws;
+  if p ? 'campaigns' then
+    foreach k in array okc loop if p->'campaigns' ? k then c := c || jsonb_build_object(k, (p->'campaigns'->>k)::boolean); end if; end loop;
+    s.campaigns := s.campaigns || c;
+  end if;
+  if p ? 'from_name'       then s.from_name := left(trim(p->>'from_name'), 80); end if;
+  if p ? 'from_local'      then
+    if coalesce(p->>'from_local','') !~ '^[a-z0-9][a-z0-9._-]{0,40}$' then raise exception 'The from address can use letters, numbers, dots and dashes'; end if;
+    s.from_local := p->>'from_local'; end if;
+  if p ? 'office_reply_to' then
+    if coalesce(p->>'office_reply_to','') <> '' and p->>'office_reply_to' !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Check the reply-to email'; end if;
+    s.office_reply_to := lower(trim(p->>'office_reply_to')); end if;
+  if p ? 'mailing_address' then s.mailing_address := left(trim(p->>'mailing_address'), 200); end if;
+  if p ? 'review_url'      then
+    if coalesce(p->>'review_url','') <> '' and p->>'review_url' !~* '^https://' then raise exception 'The review link should start with https://'; end if;
+    s.review_url := left(trim(p->>'review_url'), 500); end if;
+  if p ? 'timezone'        then
+    if not exists (select 1 from pg_timezone_names where name = p->>'timezone') then raise exception 'Unknown time zone'; end if;
+    s.timezone := p->>'timezone'; end if;
+  if p ? 'field_days'      then s.field_days := jsonb_build_object(
+      'review',   least(greatest(coalesce((p->'field_days'->>'review')::int, 30), 1), 365),
+      'referral', least(greatest(coalesce((p->'field_days'->>'referral')::int, 60), 1), 365)); end if;
+  if p ? 'test_to'         then
+    if coalesce(p->>'test_to','') <> '' and p->>'test_to' !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Check the test email'; end if;
+    s.test_to := lower(trim(p->>'test_to')); end if;
+  if p ? 'enabled'         then s.enabled := (p->>'enabled')::boolean; end if;
+  if s.enabled and s.mailing_address = '' then raise exception 'Add your mailing address first. Every email has to show it.'; end if;
+  update email_settings set enabled = s.enabled, from_name = s.from_name, from_local = s.from_local, office_reply_to = s.office_reply_to,
+    mailing_address = s.mailing_address, review_url = s.review_url, timezone = s.timezone, campaigns = s.campaigns,
+    field_days = s.field_days, test_to = s.test_to, updated_by = auth.uid(), updated_at = now()
+  where workspace_id = ws;
+end $$;
+
+-- Owner/manager: rewrite one email, or put it back to the default (empty subject and body).
+create or replace function public.email_template_save(ws uuid, p_campaign text, p_step text, p_subject text, p_body text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager(ws) then raise exception 'Only an owner or manager can change email wording'; end if;
+  if email_defaults()->p_campaign->p_step is null then raise exception 'Unknown email'; end if;
+  if coalesce(trim(p_subject),'') = '' and coalesce(trim(p_body),'') = '' then
+    delete from email_templates where workspace_id = ws and campaign = p_campaign and step = p_step; return;
+  end if;
+  if coalesce(trim(p_subject),'') = '' or coalesce(trim(p_body),'') = '' then raise exception 'Fill in both the subject and the email'; end if;
+  insert into email_templates(workspace_id, campaign, step, subject, body) values (ws, p_campaign, p_step, left(trim(p_subject), 150), left(p_body, 4000))
+    on conflict (workspace_id, campaign, step) do update set subject = excluded.subject, body = excluded.body, updated_at = now();
+end $$;
+
+-- Rep app: what's next for this lead's emails.
+create or replace function public.email_lead(p_lead text) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare l leads; s email_settings; pl text; nx record; last record;
+begin
+  select * into l from leads where id = p_lead;
+  if l.id is null or not public.is_member(l.workspace_id) or not public.can_see_lead(p_lead) then return null; end if;
+  select * into s from email_settings where workspace_id = l.workspace_id;
+  if s.workspace_id is null or not s.enabled then return jsonb_build_object('on', false); end if;
+  select plan into pl from workspaces where id = l.workspace_id;
+  select x.campaign, x.step, x.due into nx from _email_steps(l, pl, s.field_days) x
+    where coalesce(s.campaigns->>x.campaign, 'false') = 'true' and x.due > now() - interval '2 days'
+      and not exists (select 1 from email_sends e where e.workspace_id = l.workspace_id and e.lead_id = l.id and e.campaign = x.campaign and e.step = x.step)
+    order by x.due limit 1;
+  select e.campaign, coalesce(e.sent_at, e.created_at) as at, e.status into last from email_sends e
+    where e.workspace_id = l.workspace_id and e.lead_id = l.id and e.status <> 'skipped' order by e.created_at desc limit 1;
+  return jsonb_build_object('on', true,
+    'email', coalesce(l.data->>'email','') <> '',
+    'unsub', exists (select 1 from email_unsubs u where u.workspace_id = l.workspace_id and u.email = lower(trim(coalesce(l.data->>'email','')))),
+    'next', case when nx.campaign is null then null else jsonb_build_object('campaign', nx.campaign, 'at', greatest(nx.due, now())) end,
+    'last', case when last.campaign is null then null else jsonb_build_object('campaign', last.campaign, 'at', last.at, 'status', last.status) end);
+end $$;
+
+revoke execute on function public.email_status(uuid), public.email_save(uuid, jsonb), public.email_template_save(uuid, text, text, text, text), public.email_lead(text) from public, anon;
+grant execute on function public.email_status(uuid), public.email_save(uuid, jsonb), public.email_template_save(uuid, text, text, text, text), public.email_lead(text) to authenticated;
+-- The sender takes a batch so two runs can never send the same email. Anything stuck mid-send for 15 minutes
+-- is marked failed, never retried (better a missed email than a double one).
+create or replace function public.email_claim(p_limit int) returns setof public.email_sends
+language plpgsql security definer set search_path = public as $$
+begin
+  update email_sends set status = 'failed', error = 'Stopped mid-send' where status = 'sending' and claimed_at < now() - interval '15 minutes';
+  return query
+    update email_sends e set status = 'sending', claimed_at = now()
+    where e.id in (select id from email_sends where status = 'queued' order by created_at limit greatest(p_limit, 1) for update skip locked)
+    returning e.*;
+end $$;
+
+revoke execute on function public.email_enqueue(), public.email_claim(int), public._email_steps(public.leads, text, jsonb) from public, anon, authenticated;
+do $$ begin execute 'grant execute on function public.email_enqueue(), public.email_claim(int) to service_role'; exception when others then null; end $$;
+
+-- Every 15 minutes: queue who's due, then wake the sender if anything is waiting.
+-- Daily: keep a year of send history.
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') and exists (select 1 from pg_extension where extname = 'pg_net') then
+    perform cron.schedule('ruva-email-queue', '*/15 * * * *', $c$ select public.email_enqueue(); $c$);
+    perform cron.schedule('ruva-email-send', '1-59/5 * * * *', $c$
+      select net.http_post(
+        url := 'https://fixqhaewtyddieoimmrv.supabase.co/functions/v1/email',
+        headers := jsonb_build_object('Content-Type', 'application/json'),
+        body := jsonb_build_object('action', 'run', 'token', (select cron_token from public.email_cfg where id = 1)))
+      where exists (select 1 from public.email_sends where status = 'queued');$c$);
+    perform cron.schedule('ruva-email-purge', '55 7 * * *', $c$ delete from public.email_sends where created_at < now() - interval '400 days';$c$);
+  end if;
+exception when others then null; end $$;
+
+-- Pin the search path on the small helpers (Supabase advisor).
+alter function public.email_defaults() set search_path = public;
+alter function public._email_stage(public.leads) set search_path = public;
+alter function public._email_ms(text) set search_path = public;
