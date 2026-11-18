@@ -3170,3 +3170,181 @@ end $$;
 
 revoke execute on function public.ho_pick(text, int), public.ho_sign(text, text, text), public.ho_view(text) from public;
 grant execute on function public.ho_pick(text, int), public.ho_sign(text, text, text), public.ho_view(text) to anon, authenticated;
+
+-- 15. Review fixes (3): longer invite codes, pin history follows "hide teammates' pins", protection dates
+-- capped at the company's window, job numbers handed out by the server, and the one-time Stripe setup
+-- race. Safe to run more than once. No table or column changes; existing data is not touched.
+
+-- ---------------------------------------------------------------------------------------------
+-- Invite codes: 10 characters from 32 easy-to-read letters and digits (no 0, O, 1 or I), about
+-- 1 in a quadrillion per guess instead of 1 in 16 million. Old 6-character codes keep working.
+-- Randomness comes from gen_random_uuid(), which is built in (pgcrypto lives in another schema).
+-- ---------------------------------------------------------------------------------------------
+create or replace function public._invite_code() returns text
+language plpgsql volatile set search_path = public as $$
+declare a text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; b bytea; c text; i int;  -- 32 characters, so each byte maps evenly
+begin
+  loop
+    b := decode(replace(gen_random_uuid()::text, '-', ''), 'hex');
+    c := '';
+    -- skip bytes 6 and 8: they carry the UUID version and variant bits
+    foreach i in array array[0,1,2,3,4,5,9,10,11,12] loop
+      c := c || substr(a, (get_byte(b, i) % 32) + 1, 1);
+    end loop;
+    exit when not exists (select 1 from invites where code = c);
+  end loop;
+  return c;
+end $$;
+revoke execute on function public._invite_code() from public, anon, authenticated;
+
+create or replace function public.create_invite(ws uuid, p_role text)
+returns text language plpgsql security definer set search_path = public as $$
+declare c text;
+begin
+  if not public.is_manager(ws) then raise exception 'Only managers can invite'; end if;
+  c := public._invite_code();
+  insert into invites(code, workspace_id, role, created_by) values (c, ws, p_role, auth.uid());
+  return c;
+end $$;
+
+create or replace function public.create_invite_for(ws uuid, p_role text, p_name text, p_phone text, p_email text)
+returns text language plpgsql security definer set search_path = public as $$
+declare c text;
+begin
+  if not public.is_manager(ws) then raise exception 'Only managers can invite'; end if;
+  if p_role not in ('manager','rep','office') then raise exception 'Unknown role'; end if;
+  c := public._invite_code();
+  insert into invites(code, workspace_id, role, created_by, max_uses, expires_at, name, phone, email)
+  values (c, ws, p_role, auth.uid(), 1, now() + interval '30 days', coalesce(trim(p_name),''), coalesce(trim(p_phone),''), coalesce(lower(trim(p_email)),''));
+  return c;
+end $$;
+
+create or replace function public.admin_invite(ws uuid, p_role text) returns text
+language plpgsql security definer set search_path = public as $$
+declare c text; w workspaces;
+begin
+  perform public._need_admin();
+  if p_role not in ('manager','rep','office') then raise exception 'Unknown role'; end if;
+  select * into w from workspaces where id = ws;
+  c := public._invite_code();
+  insert into invites(code, workspace_id, role, created_by) values (c, ws, p_role, w.owner_id);
+  perform public._alog(ws, 'Support made a ' || p_role || ' invite code');
+  return c;
+end $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- Pin history: when "Teammates' pins on the map" is off, a rep gets nothing back for a
+-- teammate's door, the same as team_pins. Owners, managers, office and the lead's own rep
+-- still see it.
+-- ---------------------------------------------------------------------------------------------
+create or replace function public.pin_history(lid text)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('created_by', l.created_by, 'created_at', l.created_at, 'owner_id', l.owner_id,
+         'knocks', case when public.can_view_all(l.workspace_id) or l.owner_id = auth.uid()
+                        then coalesce(l.data->'knocks','[]'::jsonb)
+                        else (select coalesce(jsonb_agg(k - 'gps'), '[]'::jsonb) from jsonb_array_elements(coalesce(l.data->'knocks','[]'::jsonb)) k) end)
+  from leads l join workspaces w on w.id = l.workspace_id
+  where l.id = lid and public.is_member(l.workspace_id)
+    and (coalesce((w.settings->>'teammate_pins')::boolean, true)
+         or public.can_view_all(l.workspace_id) or l.owner_id = auth.uid())
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- Door protection: a rep's app still renews protection each time they work the door, but the
+-- date can never be set past today + the company's protection window (protect_days, default 30).
+-- Owners and managers can still set any date.
+-- ---------------------------------------------------------------------------------------------
+create or replace function public._protect_cap(ws uuid) returns timestamptz
+language sql stable security definer set search_path = public as $$
+  select now() + make_interval(days => greatest(1, coalesce((select (settings->>'protect_days')::int from workspaces where id = ws), 30)))
+$$;
+
+create or replace function public.leads_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') then return new; end if;
+  -- Reports the owner, a manager or the office attached can only be removed by them, not by the rep
+  if not public.can_view_all(old.workspace_id) and exists (
+       select 1 from jsonb_array_elements(case when jsonb_typeof(old.data->'docs') = 'array' then old.data->'docs' else '[]'::jsonb end) d
+       where coalesce(d->>'staff','') = 'true'
+         and not (case when jsonb_typeof(new.data->'docs') = 'array' then new.data->'docs' else '[]'::jsonb end) @> jsonb_build_array(jsonb_build_object('id', d->'id'))) then
+    raise exception 'Only the office can remove a report it attached';
+  end if;
+  if public.is_manager(old.workspace_id) and public.is_manager(new.workspace_id) then return new; end if;
+  if new.workspace_id is distinct from old.workspace_id or new.owner_id is distinct from old.owner_id
+     or new.created_by is distinct from old.created_by or new.origin is distinct from old.origin
+     or new.pool is distinct from old.pool or new.posted_by is distinct from old.posted_by
+     or new.posted_at is distinct from old.posted_at or new.claimed_at is distinct from old.claimed_at then
+    raise exception 'Only a manager can change who owns a lead or its board status';
+  end if;
+  if new.protected_until is distinct from old.protected_until and new.protected_until is not null then
+    new.protected_until := least(new.protected_until, public._protect_cap(new.workspace_id));
+  end if;
+  return new;
+end $$;
+
+create or replace function public.leads_insert_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if current_user not in ('authenticated','anon') or public.is_manager(new.workspace_id) then return new; end if;
+  if new.protected_until is not null then
+    new.protected_until := least(new.protected_until, public._protect_cap(new.workspace_id));
+  end if;
+  return new;
+end $$;
+drop trigger if exists leads_insert_guard on public.leads;
+create trigger leads_insert_guard before insert on public.leads for each row execute function public.leads_insert_guard();
+
+-- ---------------------------------------------------------------------------------------------
+-- Job numbers: the dashboard used to pick the next number itself, so two office computers
+-- refreshing at the same moment could hand out the same number. Now the server hands them out
+-- one company at a time. A lead that already has a number keeps it.
+-- p_ids: leads that need a number, oldest first. Returns {lead_id: job number}.
+-- ---------------------------------------------------------------------------------------------
+create or replace function public.assign_job_nos(ws uuid, p_prefix text, p_ids text[])
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare pre text := left(upper(regexp_replace(coalesce(p_prefix,''), '[^A-Za-z]', '', 'g')), 4);
+        n int; lid text; cur text; ok boolean; res jsonb := '{}'::jsonb;
+begin
+  if not public.can_view_all(ws) then raise exception 'Not allowed'; end if;
+  if pre = '' then pre := 'RR'; end if;
+  perform pg_advisory_xact_lock(hashtext('ruva-jobno:' || ws::text));
+  select greatest(99, coalesce(max(split_part(data->>'jobNo', '-', 2)::int), 99)) into n
+    from leads where workspace_id = ws and split_part(coalesce(data->>'jobNo',''), '-', 2) ~ '^[0-9]{1,9}$';
+  foreach lid in array coalesce(p_ids[1:1000], '{}') loop
+    select true, data->>'jobNo' into ok, cur from leads where id = lid and workspace_id = ws for update;
+    continue when ok is null;
+    if coalesce(cur, '') = '' then
+      n := n + 1; cur := pre || '-' || n;
+      update leads set data = jsonb_set(data, '{jobNo}', to_jsonb(cur)) where id = lid;
+    end if;
+    res := res || jsonb_build_object(lid, cur);
+    ok := null;
+  end loop;
+  return res;
+end $$;
+revoke execute on function public.assign_job_nos(uuid, text, text[]) from public, anon;
+grant execute on function public.assign_job_nos(uuid, text, text[]) to authenticated;
+
+-- ---------------------------------------------------------------------------------------------
+-- Stripe setup: the first save of the prices, the webhook and the seat-sync token wins. If two
+-- requests set billing up at the same moment, the second keeps the first one's values (and the
+-- billing function deletes the extra webhook it made). To replace a value, clear it in the table first.
+-- ---------------------------------------------------------------------------------------------
+create or replace function public.billing_cfg_set(p_mode text, p jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare r billing_cfg;
+begin
+  insert into billing_cfg(mode) values (p_mode) on conflict (mode) do nothing;
+  update billing_cfg set
+    price_solo     = coalesce(price_solo, p->>'price_solo'),
+    price_team     = coalesce(price_team, p->>'price_team'),
+    webhook_id     = case when webhook_id is null or webhook_secret is null then coalesce(p->>'webhook_id', webhook_id) else webhook_id end,
+    webhook_secret = case when webhook_id is null or webhook_secret is null then coalesce(p->>'webhook_secret', webhook_secret) else webhook_secret end,
+    fn_url         = coalesce(p->>'fn_url', fn_url),
+    wake_token     = coalesce(nullif(wake_token, ''), p->>'wake_token', wake_token),
+    updated_at     = now()
+  where mode = p_mode returning * into r;
+  return to_jsonb(r);
+end $$;
+revoke execute on function public.billing_cfg_set(text, jsonb) from public, anon, authenticated;
