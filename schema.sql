@@ -2658,3 +2658,99 @@ do $$ begin
     perform cron.schedule('ruva-acx-purge', '50 7 * * *', $c$ delete from public.acx_log where at < now() - interval '90 days';$c$);
   end if;
 exception when others then null; end $$;
+-- 12. Plans: "full" (everything) or "field" (rep app + manager screens; office tools locked).
+-- Only RUVA sets the plan, from RUVA HQ. A company owner can't change it, even by editing the database directly.
+
+alter table public.workspaces add column if not exists plan text not null default 'full';
+do $$ begin
+  alter table public.workspaces add constraint workspaces_plan_ck check (plan in ('full','field'));
+exception when duplicate_object then null; end $$;
+
+create or replace function public._plan_guard() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  -- runs as the caller: a signed-in user (authenticated) can never change it; RUVA's HQ function runs as the owner role and can
+  if new.plan is distinct from old.plan and current_user in ('authenticated', 'anon') then
+    raise exception 'Only RUVA can change the plan';
+  end if;
+  return new;
+end $$;
+drop trigger if exists plan_guard on public.workspaces;
+create trigger plan_guard before update of plan on public.workspaces for each row execute function public._plan_guard();
+
+-- RUVA HQ: set a company's plan.
+create or replace function public.admin_set_plan(ws uuid, p_plan text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public._need_admin();
+  if p_plan not in ('full','field') then raise exception 'Pick Full or Field'; end if;
+  update workspaces set plan = p_plan where id = ws;
+  perform public._alog(ws, 'Plan set to ' || case when p_plan = 'field' then 'Field app' else 'Full RUVA' end);
+end $$;
+revoke execute on function public.admin_set_plan(uuid, text) from public, anon;
+grant execute on function public.admin_set_plan(uuid, text) to authenticated;
+
+-- HQ account card now shows the plan.
+create or replace function public.admin_account(ws uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare w workspaces; r jsonb;
+begin
+  perform public._need_admin();
+  select * into w from workspaces where id = ws;
+  if w.id is null then raise exception 'Account not found'; end if;
+  r := jsonb_build_object(
+    'id', w.id, 'name', w.name, 'kind', w.kind, 'plan', w.plan, 'created_at', w.created_at, 'owner_id', w.owner_id, 'owner_email', public._email_of(w.owner_id),
+    'active', public.ws_active(ws), 'exempt', w.billing_exempt, 'comp_until', w.comp_until, 'comp_code', w.comp_code,
+    'status', w.sub_status, 'trial_ends_at', w.trial_ends_at, 'period_end', w.period_end, 'cancel_at_period_end', w.cancel_at_period_end,
+    'seats', w.seats, 'stripe_customer', w.stripe_customer, 'stripe_mode', w.stripe_mode,
+    'grant_until', (select expires_at from support_grants where workspace_id = ws and expires_at > now()),
+    'members', coalesce((select jsonb_agg(jsonb_build_object('user_id', m.user_id, 'name', m.display_name, 'role', m.role, 'active', m.active,
+                  'email', public._email_of(m.user_id), 'joined_at', m.joined_at, 'support', m.support,
+                  'leads', (select count(*) from leads l where l.workspace_id = ws and l.owner_id = m.user_id)) order by m.support, m.joined_at)
+                from members m where m.workspace_id = ws), '[]'::jsonb),
+    'counts', jsonb_build_object(
+      'leads', (select count(*) from leads where workspace_id = ws),
+      'board', (select count(*) from leads where workspace_id = ws and pool),
+      'sold', (select count(*) from leads where workspace_id = ws and status = 'Sold'),
+      'photos', (select coalesce(sum(case when jsonb_typeof(data->'photos') = 'array' then jsonb_array_length(data->'photos') else 0 end),0) from leads where workspace_id = ws),
+      'messages', (select count(*) from messages where workspace_id = ws),
+      'trash', (select count(*) from leads_trash where workspace_id = ws and deleted_at > now() - interval '30 days')),
+    'log', coalesce((select jsonb_agg(jsonb_build_object('at', a.created_at, 'action', a.action, 'support', a.by_support,
+              'by', case when a.by_support then coalesce(public._email_of(a.actor), 'Support') else 'Owner' end) order by a.created_at desc)
+            from (select * from admin_log where workspace_id = ws order by created_at desc limit 60) a), '[]'::jsonb));
+  return r;
+end $$;
+
+-- Field plan: no homeowner pick-and-sign page.
+create or replace function public.ho_link(p_lead text, p_offer jsonb default null) returns text
+language plpgsql security definer set search_path = public as $$
+declare l leads; t text;
+begin
+  select * into l from leads where id = p_lead;
+  if l.id is null or not public.is_member(l.workspace_id) or not public.can_see_lead(p_lead) then raise exception 'not allowed'; end if;
+  if (select plan from workspaces where id = l.workspace_id) = 'field' then raise exception 'The homeowner page comes with the full RUVA plan'; end if;
+  select token into t from ho_links where lead_id = p_lead and revoked_at is null;
+  if t is null then
+    t := replace(gen_random_uuid()::text, '-', '');
+    insert into ho_links(token, workspace_id, lead_id) values (t, l.workspace_id, p_lead)
+      on conflict (lead_id) do update set token = excluded.token, revoked_at = null, created_at = now(), created_by = auth.uid();
+  end if;
+  if p_offer is not null and jsonb_typeof(p_offer->'tiers') = 'array' then
+    update leads set data = jsonb_set(data, '{ho}', coalesce(data->'ho','{}'::jsonb) || jsonb_build_object('offer', p_offer, 'offerAt', (extract(epoch from now())*1000)::bigint)) where id = p_lead;
+  end if;
+  return t;
+end $$;
+
+-- Field plan: QuickBooks can't be connected.
+create or replace function public._qbo_plan_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if (select plan from workspaces where id = new.workspace_id) = 'field' then
+    raise exception 'QuickBooks comes with the full RUVA plan';
+  end if;
+  return new;
+end $$;
+drop trigger if exists qbo_state_plan on public.qbo_state;
+create trigger qbo_state_plan before insert on public.qbo_state for each row execute function public._qbo_plan_guard();
+drop trigger if exists qbo_conn_plan on public.qbo_conn;
+create trigger qbo_conn_plan before insert on public.qbo_conn for each row execute function public._qbo_plan_guard();
