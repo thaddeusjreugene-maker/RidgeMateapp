@@ -1,4 +1,4 @@
-const APP='ridgeline-teams-v6';
+const APP='ridgeline-teams-v7';
 const SHELL=['./','./vendor/jspdf.umd.min.js','./index.html','./app.css','./config.js','./js/app.js','./js/api/demo.js','./js/api/shape.js','./js/api/supabase.js','./vendor/leaflet.js','./vendor/leaflet.css','./vendor/supabase.esm.js','./manifest.webmanifest','./push-sw.js','./icon-180.png','./icon-192.png','./icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(APP).then(c=>Promise.all(SHELL.map(u=>c.add(u).catch(()=>{})))).then(()=>self.skipWaiting()))});
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==APP).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});
@@ -22,7 +22,10 @@ self.addEventListener('push', e => {
 });
 self.addEventListener('notificationclick', e => {
   e.notification.close();
-  const url = new URL((e.notification.data && e.notification.data.url) || './', self.registration.scope).href;
+  const u = new URL((e.notification.data && e.notification.data.url) || './', self.registration.scope);
+  const tg = e.notification.tag || '';
+  if (tg.startsWith('comm:') && !u.searchParams.has('lead')) u.searchParams.set('lead', tg.slice(5));
+  const url = u.href;
   e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
     for (const c of cs) if ('focus' in c) { c.postMessage({ open: url }); return c.focus(); }
     return self.clients.openWindow(url);

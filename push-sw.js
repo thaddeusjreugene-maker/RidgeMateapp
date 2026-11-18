@@ -12,7 +12,10 @@ self.addEventListener('push', e => {
 });
 self.addEventListener('notificationclick', e => {
   e.notification.close();
-  const url = new URL((e.notification.data && e.notification.data.url) || './', self.registration.scope).href;
+  const u = new URL((e.notification.data && e.notification.data.url) || './', self.registration.scope);
+  const tg = e.notification.tag || '';
+  if (tg.startsWith('comm:') && !u.searchParams.has('lead')) u.searchParams.set('lead', tg.slice(5));
+  const url = u.href;
   e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
     for (const c of cs) if ('focus' in c) { c.postMessage({ open: url }); return c.focus(); }
     return self.clients.openWindow(url);
