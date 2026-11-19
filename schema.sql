@@ -3794,3 +3794,357 @@ begin
   end if;
 end $$;
 alter function public._email_steps(public.leads, text, jsonb) set search_path = public;
+
+-- RUVA migration 18: Storm watch and storm alert emails (Nov 19, 2026). Safe to run more than once.
+-- Two new tables, one new column, no existing lead data changes when it runs.
+--
+-- 1. storm_reports: hail and wind reports the "email" Edge Function pulls from the National Weather Service
+--    (Local Storm Reports via the Iowa Environmental Mesonet, the same feed the rep app uses). Only reports
+--    within 10 miles of a lead that could get a storm email are kept. Kept one year.
+-- 2. storm_hits: a report within the company's miles (3) of a lead, hail >= 1" or wind >= 60 mph.
+--    Storm watch leads (No Damage / Not Interested with Storm watch on) → campaign storm_watch.
+--    Past customers (completed jobs; Sold on Field) → campaign pc_storm.
+--    At most one hit per lead every 30 days (this also limits the Today cards). Only made for a company
+--    that has that campaign switched on.
+-- 3. email_settings.storm: {"miles":3,"hail":1,"wind":60}.
+-- 4. _email_steps: a storm hit becomes a "s<hit id>" step for that lead, due when the hit was made, so
+--    email_enqueue's rules (Mon–Sat 9–6, 2-day window, one a day, cap, unsubscribes, paused) apply.
+-- 5. email_defaults: wording for storm_watch.s and pc_storm.s. email_save: the two campaigns and storm settings.
+-- 6. storm_hits_list / storm_hit_dismiss: the rep app's Today cards.
+-- 7. Unsubscribe, bounce or spam report turns Storm watch off on that person's leads, with a note.
+-- 8. Cron: ruva-storm-fetch every 30 minutes (only while some company has a storm campaign on),
+--    ruva-storm-purge daily.
+
+create table if not exists public.storm_reports (
+  id         text primary key,                        -- valid|lat|lng|type, the same id the rep app uses
+  kind       text not null check (kind in ('hail','wind')),
+  mag        numeric not null default 0,              -- hail: inches; wind: mph
+  at         timestamptz not null,
+  lat        double precision not null,
+  lng        double precision not null,
+  place      text not null default '',
+  src        text not null default '',
+  remark     text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists storm_reports_at on public.storm_reports(at);
+
+create table if not exists public.storm_hits (
+  id           bigserial primary key,
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id      text not null,
+  report_id    text not null references public.storm_reports(id) on delete cascade,
+  campaign     text not null check (campaign in ('storm_watch','pc_storm')),
+  kind         text not null,
+  mag          numeric not null default 0,
+  at           timestamptz not null,                  -- when the storm hit
+  miles        numeric not null,
+  what         text not null default '',              -- 1.25" hail · 65 mph wind
+  place        text not null default '',
+  dismissed_at timestamptz,
+  dismissed_by uuid,
+  created_at   timestamptz not null default now(),
+  unique (workspace_id, lead_id, report_id)
+);
+create index if not exists storm_hits_lead on public.storm_hits(workspace_id, lead_id, at desc);
+create index if not exists storm_hits_recent on public.storm_hits(workspace_id, created_at desc);
+
+alter table public.storm_reports enable row level security;
+alter table public.storm_hits    enable row level security;
+revoke all on public.storm_reports, public.storm_hits from anon, authenticated;
+do $$ begin
+  execute 'grant all on public.storm_reports, public.storm_hits to service_role';
+  execute 'grant usage, select on sequence public.storm_hits_id_seq to service_role';
+exception when others then null; end $$;
+
+alter table public.email_settings add column if not exists storm jsonb not null default '{"miles":3,"hail":1,"wind":60}'::jsonb;
+
+-- Miles between two points.
+create or replace function public._miles(a_lat double precision, a_lng double precision, b_lat double precision, b_lng double precision)
+returns double precision language sql immutable set search_path = public as $$
+  select 3958.8 * 2 * asin(least(1, sqrt(power(sin(radians(b_lat - a_lat) / 2), 2)
+       + cos(radians(a_lat)) * cos(radians(b_lat)) * power(sin(radians(b_lng - a_lng) / 2), 2)))) $$;
+
+-- The house: the lead's map spot, else where the rep stood when logging it.
+create or replace function public._lead_lat(l public.leads) returns double precision language sql immutable set search_path = public as $$
+  select coalesce(l.lat, case when l.data->>'pinned_lat' ~ '^-?\d+(\.\d+)?$' then (l.data->>'pinned_lat')::double precision end) $$;
+create or replace function public._lead_lng(l public.leads) returns double precision language sql immutable set search_path = public as $$
+  select coalesce(l.lng, case when l.data->>'pinned_lng' ~ '^-?\d+(\.\d+)?$' then (l.data->>'pinned_lng')::double precision end) $$;
+
+-- Which storm email a lead could get: storm_watch, pc_storm or nothing.
+-- Past customers use the past-customer rule: a completed job; on Field, any Sold lead.
+create or replace function public._storm_campaign(l public.leads, plan text) returns text
+language sql stable set search_path = public as $$
+  select case
+    when not coalesce(l.pool, false) and l.status in ('No Damage','Not Interested') and coalesce(l.data->>'stormWatch','') = 'true' then 'storm_watch'
+    when l.status = 'Sold' and (plan = 'field' or coalesce(public._email_ms(l.data->>'closed'), 'infinity'::timestamptz) <= now()) then 'pc_storm'
+  end $$;
+
+-- Storm settings with limits.
+create or replace function public._storm_cfg(s jsonb) returns jsonb language sql immutable set search_path = public as $$
+  select jsonb_build_object(
+    'miles', least(greatest(coalesce(case when s->>'miles' ~ '^\d+(\.\d+)?$' then (s->>'miles')::numeric end, 3), 1), 10),
+    'hail',  least(greatest(coalesce(case when s->>'hail'  ~ '^\d+(\.\d+)?$' then (s->>'hail')::numeric  end, 1), 0.75), 3),
+    'wind',  least(greatest(coalesce(case when s->>'wind'  ~ '^\d+(\.\d+)?$' then (s->>'wind')::numeric  end, 60), 50), 100)) $$;
+
+-- Where the server should look: one box per company that has a storm campaign on, around the leads that qualify.
+create or replace function public.storm_areas() returns jsonb
+language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('ws', b.ws,
+           'w', floor((b.w - b.pad / cos(radians(b.n))) * 2) / 2, 'e', ceil((b.e + b.pad / cos(radians(b.n))) * 2) / 2,
+           's', floor((b.s - b.pad) * 2) / 2, 'n', ceil((b.n + b.pad) * 2) / 2)), '[]'::jsonb)
+  from (
+    select s.workspace_id ws, min(_lead_lng(l)) w, max(_lead_lng(l)) e, min(_lead_lat(l)) s, max(_lead_lat(l)) n,
+           ((_storm_cfg(s.storm)->>'miles')::numeric + 1) / 69.0 pad
+    from email_settings s join workspaces w on w.id = s.workspace_id join leads l on l.workspace_id = s.workspace_id
+    where _lead_lat(l) between -90 and 90 and _lead_lng(l) between -180 and 180
+      and coalesce(s.campaigns->>_storm_campaign(l, w.plan), 'false') = 'true'
+    group by s.workspace_id, s.storm) b $$;
+
+-- Find hits: reports from the last 3 days near leads that qualify. Earliest storm wins; then 30 days quiet.
+create or replace function public.storm_match() returns int
+language plpgsql security definer set search_path = public as $$
+declare r record; added int := 0;
+begin
+  for r in
+    select distinct on (l.workspace_id, l.id) l.workspace_id ws, l.id lid, c.camp, sr.id rid, sr.kind, sr.mag, sr.at, sr.place, m.mi
+    from email_settings s
+    join workspaces w on w.id = s.workspace_id
+    cross join lateral (select _storm_cfg(s.storm) cfg) g
+    join leads l on l.workspace_id = s.workspace_id
+    cross join lateral (select _storm_campaign(l, w.plan) camp, _lead_lat(l) la, _lead_lng(l) lo) c
+    join storm_reports sr on sr.at > now() - interval '3 days'
+      and sr.lat between c.la - 0.2 and c.la + 0.2 and sr.lng between c.lo - 0.3 and c.lo + 0.3
+    cross join lateral (select _miles(c.la, c.lo, sr.lat, sr.lng) mi) m
+    where c.camp is not null and coalesce(s.campaigns->>c.camp, 'false') = 'true'
+      and m.mi <= (g.cfg->>'miles')::numeric
+      and ((sr.kind = 'hail' and sr.mag >= (g.cfg->>'hail')::numeric) or (sr.kind = 'wind' and sr.mag >= (g.cfg->>'wind')::numeric))
+      and not exists (select 1 from storm_hits h where h.workspace_id = l.workspace_id and h.lead_id = l.id
+                        and h.at > sr.at - interval '30 days' and h.at < sr.at + interval '30 days')
+    order by l.workspace_id, l.id, sr.at, sr.mag desc
+  loop
+    insert into storm_hits(workspace_id, lead_id, report_id, campaign, kind, mag, at, miles, what, place)
+    values (r.ws, r.lid, r.rid, r.camp, r.kind, r.mag, r.at, round(r.mi::numeric, 1),
+            case when r.kind = 'hail' then rtrim(rtrim(round(r.mag, 2)::text, '0'), '.') || '" hail' else round(r.mag)::text || ' mph wind' end,
+            r.place)
+    on conflict do nothing;
+    if found then added := added + 1; end if;
+  end loop;
+  return added;
+end $$;
+
+-- The Edge Function hands over what it fetched. Keeps only hail/wind reports within 10 miles of a lead
+-- that could get a storm email, then looks for hits.
+create or replace function public.storm_ingest(p jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare kept int := 0; hits int;
+begin
+  with x as (
+    select left(e->>'id', 120) id, e->>'kind' kind,
+           case when e->>'mag' ~ '^\d+(\.\d+)?$' then (e->>'mag')::numeric else 0 end mag,
+           case when e->>'at' ~ '^\d{10,14}$' then to_timestamp((e->>'at')::numeric / 1000) else (e->>'at')::timestamptz end at,
+           (e->>'lat')::double precision lat, (e->>'lng')::double precision lng,
+           left(coalesce(e->>'place',''), 120) place, left(coalesce(e->>'src',''), 80) src, left(coalesce(e->>'remark',''), 400) remark
+    from jsonb_array_elements(case when jsonb_typeof(p) = 'array' then p else '[]'::jsonb end) e
+    where e->>'kind' in ('hail','wind') and coalesce(e->>'id','') <> ''
+      and e->>'lat' ~ '^-?\d+(\.\d+)?$' and e->>'lng' ~ '^-?\d+(\.\d+)?$'),
+  ins as (
+    insert into storm_reports(id, kind, mag, at, lat, lng, place, src, remark)
+    select x.id, x.kind, x.mag, x.at, x.lat, x.lng, x.place, x.src, x.remark from x
+    where x.at > now() - interval '3 days' and x.at < now() + interval '1 hour'
+      and exists (select 1 from email_settings s join workspaces w on w.id = s.workspace_id join leads l on l.workspace_id = s.workspace_id
+                  where coalesce(s.campaigns->>_storm_campaign(l, w.plan), 'false') = 'true'
+                    and _lead_lat(l) between x.lat - 0.2 and x.lat + 0.2 and _lead_lng(l) between x.lng - 0.3 and x.lng + 0.3
+                    and _miles(_lead_lat(l), _lead_lng(l), x.lat, x.lng) <= 10)
+    on conflict (id) do update set mag = greatest(storm_reports.mag, excluded.mag)
+    returning 1)
+  select count(*) into kept from ins;
+  hits := storm_match();
+  return jsonb_build_object('reports', kept, 'hits', hits);
+end $$;
+
+revoke execute on function public.storm_areas(), public.storm_match(), public.storm_ingest(jsonb) from public, anon, authenticated;
+do $$ begin execute 'grant execute on function public.storm_areas(), public.storm_match(), public.storm_ingest(jsonb) to service_role'; exception when others then null; end $$;
+
+-- Rep app Today: storm hits from the last 14 days that nobody dismissed. Reps see their own leads;
+-- owners, managers and office see the company's.
+create or replace function public.storm_hits_list(ws uuid) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('id', h.id, 'lead_id', h.lead_id, 'campaign', h.campaign, 'what', h.what,
+           'at', h.at, 'miles', h.miles, 'place', h.place,
+           'emailed', exists (select 1 from email_sends e where e.workspace_id = h.workspace_id and e.lead_id = h.lead_id
+                                and e.campaign = h.campaign and e.step = 's' || h.id and e.status = 'sent'))
+         order by h.at desc), '[]'::jsonb)
+  from storm_hits h join leads l on l.id = h.lead_id and l.workspace_id = h.workspace_id
+  where public.is_member(ws) and h.workspace_id = ws and h.dismissed_at is null and h.created_at > now() - interval '14 days'
+    and (public.can_view_all(ws) or l.owner_id = auth.uid()) $$;
+
+create or replace function public.storm_hit_dismiss(p_id bigint) returns void
+language plpgsql security definer set search_path = public as $$
+declare h storm_hits;
+begin
+  select * into h from storm_hits where id = p_id;
+  if h.id is null or not public.is_member(h.workspace_id) or not public.can_see_lead(h.lead_id) then raise exception 'not allowed'; end if;
+  update storm_hits set dismissed_at = now(), dismissed_by = auth.uid() where id = p_id and dismissed_at is null;
+end $$;
+
+revoke execute on function public.storm_hits_list(uuid), public.storm_hit_dismiss(bigint) from public, anon;
+grant execute on function public.storm_hits_list(uuid), public.storm_hit_dismiss(bigint) to authenticated;
+
+-- Unsubscribed, bounced or marked as spam: Storm watch goes off on that person's leads in that company.
+create or replace function public._storm_watch_off() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare ms bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+  why text := case new.reason when 'bounced' then 'email bounced' when 'complained' then 'marked as spam' else 'unsubscribed' end;
+begin
+  update leads set data = data || jsonb_build_object('stormWatch', false, 'stormWatchAt', ms,
+      'log', (case when jsonb_typeof(data->'log') = 'array' then data->'log' else '[]'::jsonb end)
+             || jsonb_build_array(jsonb_build_object('t', ms, 'text', 'Storm watch off (' || why || ')')))
+  where workspace_id = new.workspace_id and lower(trim(coalesce(data->>'email',''))) = new.email
+    and coalesce(data->>'stormWatch','') = 'true';
+  return null;
+end $$;
+revoke execute on function public._storm_watch_off() from public, anon, authenticated;
+drop trigger if exists storm_watch_off on public.email_unsubs;
+create trigger storm_watch_off after insert or update on public.email_unsubs for each row execute function public._storm_watch_off();
+
+-- Default wording (now with the two storm emails). A company's own edits (email_templates) win.
+create or replace function public.email_defaults() returns jsonb language sql immutable as $$
+select '{
+ "inspected_no_answer": {
+  "d3":  {"subject":"Your roof inspection at {address}","body":"Hi {first_name}, it''s {rep_name} with {company}. Thanks again for letting me look at your roof. If you have any questions about what I found or the estimate, just reply here or call me at {rep_phone}."},
+  "d7":  {"subject":"Checking in on your roof","body":"Hi {first_name}, I wanted to check back in. Small roof problems usually get bigger, and it''s easier to deal with them now. I''m glad to walk through the estimate with you, no pressure. {rep_phone}"},
+  "d14": {"subject":"Last note from me","body":"Hi {first_name}, this is my last follow-up so I don''t crowd your inbox. If you ever want to pick this back up, reply here and I''ll take care of you.\n\n{rep_name}, {company}"}},
+ "not_inspected": {
+  "d2":  {"subject":"Free roof inspection","body":"Hi {first_name}, it''s {rep_name} with {company}. I can come out and inspect your roof for free. It takes about 30 minutes, and you''ll get photos of everything I see. Reply with a day that works, or call {rep_phone}."},
+  "d7":  {"subject":"Still want that roof check?","body":"Hi {first_name}, just following up. If now isn''t a good time, no problem. If you''d like the inspection, reply and I''ll get you on the schedule.\n\n{rep_name}"}},
+ "cold_checkin": {
+  "m":   {"subject":"Still here if you need us","body":"Hi {first_name}, it''s {rep_name} with {company}. Just checking in. If your roof took a hit or you''re ready to talk about it, reply here or call {rep_phone}."}},
+ "storm_watch": {
+  "s":   {"subject":"Storm near {address}","body":"Hi {first_name}, it''s {rep_name} with {company}. The weather service reported {storm} near your home on {storm_date}. Damage from a storm like that isn''t always easy to see from the ground. If you''d like, I''ll take a free look. Reply here or call me at {rep_phone}."}},
+ "pc_storm": {
+  "s":   {"subject":"Storm near your home","body":"Hi {first_name}, the weather service reported {storm} near {address} on {storm_date}. Your roof should hold up well, but if you see shingles in the yard, dents or a leak, reply here and {company} will come check it for free."}},
+ "pc_review": {
+  "r":   {"subject":"How did we do?","body":"Hi {first_name}, thanks for trusting {company} with your roof. If we did right by you, a quick review helps us a lot: {review_url}\n\nIf anything isn''t right, reply here and we''ll fix it."}},
+ "pc_referral": {
+  "f":   {"subject":"Know someone who needs a roof?","body":"Hi {first_name}, our best work comes from neighbors telling neighbors. If you know someone with roof damage or an old roof, reply with their name or pass along our number. We''ll treat them the way we treated you."}},
+ "pc_yearly": {
+  "y":   {"subject":"Your yearly roof check","body":"Hi {first_name}, it''s been a year since we put the roof on at {address}. We''ll come check it over for free. Reply and we''ll set up a time."}}
+}'::jsonb $$;
+
+-- Every step a lead could get, now with storm emails first. The rest is migration 17's rule.
+create or replace function public._email_steps(l public.leads, plan text, fdays jsonb)
+returns table(campaign text, step text, due timestamptz)
+language plpgsql stable set search_path = public as $$
+declare st text := _email_stage(l); t text := coalesce(nullif(l.data->>'temp',''),'warm');
+  t_at timestamptz := _email_ms(l.data->>'tempAt'); insp timestamptz; a timestamptz; n int;
+  done timestamptz := _email_ms(l.data->>'closed'); sc text := _storm_campaign(l, plan); h record;
+begin
+  -- Storm hits (migration 18): one step per hit, due when the hit was made.
+  if sc is not null then
+    for h in select x.id, x.created_at from storm_hits x where x.workspace_id = l.workspace_id and x.lead_id = l.id
+               and x.campaign = sc and x.created_at > now() - interval '30 days' loop
+      campaign := sc; step := 's' || h.id; due := h.created_at; return next;
+    end loop;
+  end if;
+  if st in ('N','I') then
+    if t = 'hot' or l.owner_id is null or l.pool then return; end if;
+    if t = 'cold' then
+      a := coalesce(t_at, l.updated_at);
+      for n in 1..36 loop campaign := 'cold_checkin'; step := 'm' || n || '@' || to_char(a, 'YYYY-MM-DD'); due := a + make_interval(months => n); return next; end loop;
+      return;
+    end if;
+    if st = 'I' then
+      select max(_email_ms(k->>'t')) into insp from jsonb_array_elements(coalesce(l.data->'knocks','[]'::jsonb)) k
+        where k->>'r' in ('Inspected','Claim Pending');
+      a := greatest(coalesce(insp, l.created_at), coalesce(t_at, '-infinity'::timestamptz));
+      campaign := 'inspected_no_answer';
+      step := 'd3';  due := a + interval '3 days';  return next;
+      step := 'd7';  due := a + interval '7 days';  return next;
+      step := 'd14'; due := a + interval '14 days'; return next;
+    elsif l.status <> 'Inspection Scheduled' then
+      a := greatest(l.created_at, coalesce(t_at, '-infinity'::timestamptz));
+      campaign := 'not_inspected';
+      step := 'd2'; due := a + interval '2 days'; return next;
+      step := 'd7'; due := a + interval '7 days'; return next;
+    end if;
+  elsif st = 'S' then
+    if done is not null and done <= now() then
+      -- Marked completed (either plan): count from that day.
+      a := done;
+      campaign := 'pc_review';   step := 'r'; due := a + interval '7 days';  return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + interval '30 days'; return next;
+    elsif plan = 'field' then
+      a := _email_ms(l.data->'sale'->>'soldAt');
+      if a is null then return; end if;
+      campaign := 'pc_review';   step := 'r'; due := a + make_interval(days => coalesce((fdays->>'review')::int, 30));   return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + make_interval(days => coalesce((fdays->>'referral')::int, 60)); return next;
+    else
+      -- Full: count from the install date once the job is built (Installed, Final check paid or invoiced).
+      if not (coalesce(l.data->'sale'->>'stage','') in ('Installed','Final check paid') or coalesce(l.data->'sale'->'inv'->>'sentAt','') <> '') then return; end if;
+      a := _email_ms(l.data->'sale'->'install'->>'at');
+      if a is null or a > now() then return; end if;
+      campaign := 'pc_review';   step := 'r'; due := a + interval '7 days';  return next;
+      campaign := 'pc_referral'; step := 'f'; due := a + interval '30 days'; return next;
+    end if;
+    for n in 1..10 loop campaign := 'pc_yearly'; step := 'y' || n; due := a + make_interval(years => n); return next; end loop;
+  end if;
+end $$;
+alter function public._email_steps(public.leads, text, jsonb) set search_path = public;
+revoke execute on function public._email_steps(public.leads, text, jsonb) from public, anon, authenticated;
+
+-- Owner/manager: save settings (now with storm_watch, pc_storm and storm settings). Turning email on needs a mailing address (the law requires it in every email).
+create or replace function public.email_save(ws uuid, p jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+declare s email_settings; okc text[] := array['inspected_no_answer','not_inspected','cold_checkin','pc_review','pc_referral','pc_yearly','storm_watch','pc_storm'];
+  c jsonb := '{}'::jsonb; k text;
+begin
+  if not public.is_manager(ws) then raise exception 'Only an owner or manager can change email settings'; end if;
+  insert into email_settings(workspace_id) values (ws) on conflict do nothing;
+  select * into s from email_settings where workspace_id = ws;
+  if p ? 'campaigns' then
+    foreach k in array okc loop if p->'campaigns' ? k then c := c || jsonb_build_object(k, (p->'campaigns'->>k)::boolean); end if; end loop;
+    s.campaigns := s.campaigns || c;
+  end if;
+  if p ? 'from_name'       then s.from_name := left(trim(p->>'from_name'), 80); end if;
+  if p ? 'from_local'      then
+    if coalesce(p->>'from_local','') !~ '^[a-z0-9][a-z0-9._-]{0,40}$' then raise exception 'The from address can use letters, numbers, dots and dashes'; end if;
+    s.from_local := p->>'from_local'; end if;
+  if p ? 'office_reply_to' then
+    if coalesce(p->>'office_reply_to','') <> '' and p->>'office_reply_to' !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Check the reply-to email'; end if;
+    s.office_reply_to := lower(trim(p->>'office_reply_to')); end if;
+  if p ? 'mailing_address' then s.mailing_address := left(trim(p->>'mailing_address'), 200); end if;
+  if p ? 'review_url'      then
+    if coalesce(p->>'review_url','') <> '' and p->>'review_url' !~* '^https://' then raise exception 'The review link should start with https://'; end if;
+    s.review_url := left(trim(p->>'review_url'), 500); end if;
+  if p ? 'timezone'        then
+    if not exists (select 1 from pg_timezone_names where name = p->>'timezone') then raise exception 'Unknown time zone'; end if;
+    s.timezone := p->>'timezone'; end if;
+  if p ? 'field_days'      then s.field_days := jsonb_build_object(
+      'review',   least(greatest(coalesce((p->'field_days'->>'review')::int, 30), 1), 365),
+      'referral', least(greatest(coalesce((p->'field_days'->>'referral')::int, 60), 1), 365)); end if;
+  if p ? 'test_to'         then
+    if coalesce(p->>'test_to','') <> '' and p->>'test_to' !~* '^[^@\s]+@[^@\s]+\.[^@\s]+$' then raise exception 'Check the test email'; end if;
+    s.test_to := lower(trim(p->>'test_to')); end if;
+  if p ? 'storm'           then s.storm := _storm_cfg(s.storm || coalesce(p->'storm', '{}'::jsonb)); end if;
+  if p ? 'enabled'         then s.enabled := (p->>'enabled')::boolean; end if;
+  if s.enabled and s.mailing_address = '' then raise exception 'Add your mailing address first. Every email has to show it.'; end if;
+  update email_settings set enabled = s.enabled, from_name = s.from_name, from_local = s.from_local, office_reply_to = s.office_reply_to,
+    mailing_address = s.mailing_address, review_url = s.review_url, timezone = s.timezone, campaigns = s.campaigns,
+    field_days = s.field_days, storm = s.storm, test_to = s.test_to, updated_by = auth.uid(), updated_at = now()
+  where workspace_id = ws;
+end $$;
+
+-- Every 30 minutes, only while some company has a storm campaign on: fetch storm reports and find hits.
+-- Daily: keep a year of storm reports (their hits go with them).
+do $$ begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') and exists (select 1 from pg_extension where extname = 'pg_net') then
+    perform cron.schedule('ruva-storm-fetch', '7,37 * * * *', $c$
+      select net.http_post(
+        url := 'https://fixqhaewtyddieoimmrv.supabase.co/functions/v1/email',
+        headers := jsonb_build_object('Content-Type', 'application/json'),
+        body := jsonb_build_object('action', 'storms', 'token', (select cron_token from public.email_cfg where id = 1)))
+      where exists (select 1 from public.email_settings where campaigns->>'storm_watch' = 'true' or campaigns->>'pc_storm' = 'true');$c$);
+    perform cron.schedule('ruva-storm-purge', '57 7 * * *', $c$ delete from public.storm_reports where at < now() - interval '1 year';$c$);
+  end if;
+exception when others then null; end $$;
